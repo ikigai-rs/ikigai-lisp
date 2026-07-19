@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-lisp"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -33,3 +33,8 @@ futures = "0.3" # block_on for the async tests
 # A real sibling module, so the `(source "urn:fn:toUpper" …)` oracle proves
 # verb-as-function across a genuine module boundary, not a local stub.
 ikigai-fn = "0.1.2"
+# The real SPARQL engine, so the `(sparql-select …)` oracle runs a compiled query
+# end-to-end through `urn:sparql:select` — dev-dep ONLY (runtime reaches it via the
+# verb path, not a build link). `^0.1.5` unifies with lisp's ikigai-core (both 0.1.x),
+# so one kernel type is linked across the test.
+ikigai-sparql = "0.1.5"
