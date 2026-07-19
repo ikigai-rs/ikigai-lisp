@@ -43,17 +43,47 @@
 //! `invoke` task services each request by issuing it through the kernel (`await`)
 //! and sends the representation back. This keeps the module free of any nested
 //! executor and lets `register_fn`'s `Send + Sync + 'static` closures avoid
-//! borrowing the (non-`'static`) invocation. A fresh `Engine` per eval is the
-//! simplest correct default; caching a pure-eval face is later work.
+//! borrowing the (non-`'static`) invocation.
 //!
 //! Because an eval may `sink`/mutate, its result is **uncacheable**.
+//!
+//! ## Amortizing the engine (warm-clone pool)
+//!
+//! Building a full Steel VM (`Engine::new_sandboxed`, stdlib + no-dylib posture)
+//! costs ~50 ms; a kernel verb call costs ~1 ms. So the VM is built **once per
+//! worker** and each eval runs on a cheap **clone of that warm template**
+//! (~0.2 ms). Steel's `Engine` is `!Send` (it holds `Rc`s), so a template is
+//! pinned to the thread that built it: the module keeps a small pool of
+//! **worker threads**, each owning one warm template, and checks one out per
+//! eval (spawning a fresh one only when all are busy — so nested and concurrent
+//! evals never block each other). A worker clones its template, runs the user
+//! program on the clone, and drops the clone; the template is never mutated.
+//!
+//! **Isolation** is the crux (`urn:lisp:eval` is stateless — two unrelated
+//! evals, e.g. future wire-eval from different peers, must not share globals). A
+//! clone deep-copies the global environment, so a `(define x 5)` lands only in
+//! that clone and vanishes when it is dropped — the next eval clones a pristine
+//! template. (Steel's `GlobalCheckpoint`/`rollback_to_checkpoint` was measured
+//! *faster* but does **not** isolate — a rolled-back binding is still readable —
+//! so clone-per-eval is used.) The `PRELUDE` runs once on the template, so its
+//! definitions survive into every clone while user state does not.
+//!
+//! Verb builtins are registered once on the template and reused by every clone,
+//! so they cannot capture a per-eval channel. Instead they read the **current
+//! eval's servicing channel from a thread-local** ([`CURRENT_TX`]), which the
+//! worker sets before each run and clears after. The eval's [`Capability`] is
+//! never on the worker at all: sub-requests are serviced back on the async
+//! `invoke` side under *that* invocation's capability, so per-eval attenuation
+//! is preserved unchanged.
 
 use async_trait::async_trait;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri, ReprType,
     Representation, Request, Result, Verb,
 };
+use std::cell::RefCell;
+use std::sync::{Mutex, OnceLock};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
@@ -135,27 +165,49 @@ impl Endpoint for LispEval {
 
         let src = read_source(inv)?.to_string();
 
-        // Bridge the synchronous evaluator (its own thread) to the async kernel: a
-        // builtin sends a `VerbCall` and parks; we service each by issuing it, so the
-        // sub-request carries this invocation's capability and its golden threads
-        // fold into the result.
+        // Bridge the synchronous evaluator (a pooled worker thread with a warm
+        // engine) to the async kernel: a builtin sends a `VerbCall` and parks; we
+        // service each by issuing it, so the sub-request carries this invocation's
+        // capability and its golden threads fold into the result. `call_tx` is the
+        // only sender for this eval — the worker drops it when the run finishes,
+        // which is how the servicing loop below learns the eval is done.
         let (call_tx, call_rx) = crossbeam_channel::unbounded::<VerbCall>();
-        let handle = std::thread::spawn(move || run_steel(src, call_tx));
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<Result<String>>(1);
 
-        // `recv` returns `Err` once the evaluator thread finishes and drops every
-        // sender (its builtins and the moved handle) — the loop's natural exit.
-        while let Ok(call) = call_rx.recv() {
-            let result = dispatch(inv, &call).await;
-            // The evaluator parked on this reply; a send failure only means it went
-            // away first, which the next `recv` will observe.
-            let _ = call.reply.send(result);
+        // Check out a warm worker (or spawn one if all are busy). Sending the job
+        // cannot fail: a pooled worker is alive (its `job_rx` sender is held here),
+        // and a freshly spawned one is too.
+        let worker = checkout_worker();
+        let sent = worker.send(EvalJob {
+            src,
+            call_tx,
+            result_tx,
+        });
+
+        if sent.is_ok() {
+            // `recv` returns `Err` once the worker finishes the run and drops the
+            // eval's `call_tx` — the loop's natural exit.
+            while let Ok(call) = call_rx.recv() {
+                let result = dispatch(inv, &call).await;
+                // The evaluator parked on this reply; a send failure only means it
+                // went away first, which the next `recv` will observe.
+                let _ = call.reply.send(result);
+            }
         }
 
-        let text = handle
-            .join()
-            .map_err(|_| Error::Endpoint("lisp: evaluator thread panicked".to_string()))??;
-        // Uncacheable: an eval may sink/mutate. (No `.cacheable()`.)
-        Ok(Representation::new(text_plain_utf8(), text.into_bytes()))
+        // A live worker sends exactly one result, then is safe to reuse. A worker
+        // that died mid-run (a Steel panic) drops `result_tx`, so `recv` errors —
+        // surface it as an endpoint error and let that worker go (do not re-pool).
+        match result_rx.recv() {
+            Ok(text) => {
+                check_in_worker(worker);
+                // Uncacheable: an eval may sink/mutate. (No `.cacheable()`.)
+                Ok(Representation::new(text_plain_utf8(), text?.into_bytes()))
+            }
+            Err(_) => Err(Error::Endpoint(
+                "lisp: evaluator thread panicked".to_string(),
+            )),
+        }
     }
 
     fn name(&self) -> &str {
@@ -236,19 +288,85 @@ async fn dispatch(inv: &Invocation<'_>, call: &VerbCall) -> std::result::Result<
     }
 }
 
-/// Evaluate `src` on this thread: build a fresh engine, register the verb
-/// primitives (each forwarding to the kernel over `call_tx`), install the Scheme
-/// surface, then run the program and render its last value. Returns the rendered
-/// text, or a lisp/eval error.
-fn run_steel(src: String, call_tx: Sender<VerbCall>) -> Result<String> {
-    let mut engine = Engine::new();
-    register_primitives(&mut engine, &call_tx);
-    // The original `call_tx` and the closures' clones all drop when this function
-    // returns, disconnecting the channel so the servicing loop can exit.
-    drop(call_tx);
+/// One unit of work for a warm worker: source to evaluate, the eval's servicing
+/// channel (which the worker installs as [`CURRENT_TX`] for the run), and a
+/// one-shot channel to return the rendered result (or a lisp/eval error).
+struct EvalJob {
+    src: String,
+    call_tx: Sender<VerbCall>,
+    result_tx: Sender<Result<String>>,
+}
+
+thread_local! {
+    /// The servicing channel of the eval currently running on THIS worker thread.
+    /// The worker sets it before each run and takes (drops) it after; the verb
+    /// builtins read it at call time. A worker runs one eval at a time, so this is
+    /// unambiguous — and it is what lets the builtins be registered once on a
+    /// shared warm template yet route to the right (per-eval) servicing loop.
+    static CURRENT_TX: RefCell<Option<Sender<VerbCall>>> = const { RefCell::new(None) };
+}
+
+/// The pool of idle warm workers (each an alive thread owning one warm engine,
+/// addressed by its job sender). A busy worker is simply absent from the pool;
+/// [`checkout_worker`] spawns a new one when none are idle, so nested and
+/// concurrent evals never block one another.
+static POOL: OnceLock<Mutex<Vec<Sender<EvalJob>>>> = OnceLock::new();
+
+/// Take an idle worker, or spawn a fresh warm one. The returned sender is the
+/// handle used to submit a job and (via [`check_in_worker`]) to return the worker.
+fn checkout_worker() -> Sender<EvalJob> {
+    let pool = POOL.get_or_init(|| Mutex::new(Vec::new()));
+    if let Some(worker) = pool.lock().unwrap().pop() {
+        return worker;
+    }
+    // All warm workers are busy (or this is the first eval): spawn a new one. It
+    // builds its template once, then serves jobs until its `job_rx` sender is
+    // dropped (i.e. the worker is dropped instead of re-pooled).
+    let (job_tx, job_rx) = crossbeam_channel::unbounded::<EvalJob>();
+    std::thread::spawn(move || worker_loop(job_rx));
+    job_tx
+}
+
+/// Return a worker to the idle pool for reuse. Only ever called for a worker that
+/// completed a run cleanly (a panicked worker is dropped, not re-pooled).
+fn check_in_worker(worker: Sender<EvalJob>) {
+    if let Some(pool) = POOL.get() {
+        pool.lock().unwrap().push(worker);
+    }
+}
+
+/// A warm worker: build the template engine ONCE, then serve each job on a fresh
+/// clone. The template is never mutated (only cloned), so every eval starts from
+/// the same pristine post-prelude state — this is what gives per-eval isolation.
+fn worker_loop(job_rx: Receiver<EvalJob>) {
+    let template = build_template();
+    while let Ok(job) = job_rx.recv() {
+        // Install this eval's servicing channel for the builtins to reach.
+        CURRENT_TX.with(|slot| *slot.borrow_mut() = Some(job.call_tx));
+        let mut engine = template.clone();
+        let result = run_program(&mut engine, job.src);
+        // Drop the eval's `call_tx` so the async servicing loop exits, THEN hand
+        // back the result. (Dropping the clone here also releases its state.)
+        CURRENT_TX.with(|slot| *slot.borrow_mut() = None);
+        let _ = job.result_tx.send(result);
+    }
+}
+
+/// Build the warm template: a sandboxed engine (full stdlib, dylib loading
+/// blocked), the verb primitives registered, and the Scheme [`PRELUDE`] run once.
+/// The prelude's definitions live in the template and so survive into every clone.
+fn build_template() -> Engine {
+    let mut engine = Engine::new_sandboxed();
+    register_primitives(&mut engine);
     engine
         .run(PRELUDE)
-        .map_err(|e| Error::Endpoint(format!("lisp: prelude failed: {e}")))?;
+        .expect("lisp: prelude is a constant and must compile");
+    engine
+}
+
+/// Run `src` on `engine` (a fresh clone) and render its last value. Returns the
+/// rendered text, or a lisp/eval error.
+fn run_program(engine: &mut Engine, src: String) -> Result<String> {
     let values = engine
         .run(src)
         .map_err(|e| Error::Endpoint(format!("lisp: {e}")))?;
@@ -265,57 +383,48 @@ fn render_value(value: &SteelVal) -> String {
 }
 
 /// Register the fixed-arity verb primitives the Scheme [`PRELUDE`] wraps. Each
-/// closure is `Send + Sync + 'static` (it captures only a channel sender), sends a
-/// `VerbCall`, and parks on the reply — an `Err` reply becomes a catchable Steel
-/// error via Steel's `Result` conversion.
-fn register_primitives(engine: &mut Engine, call_tx: &Sender<VerbCall>) {
-    let tx = call_tx.clone();
-    engine.register_fn("%source", move |iri: String| {
-        call(&tx, Verb::Source, iri, None, None, None)
+/// closure is `Send + Sync + 'static` (it captures nothing), reads the current
+/// eval's servicing channel from [`CURRENT_TX`], sends a `VerbCall`, and parks on
+/// the reply — an `Err` reply becomes a catchable Steel error via Steel's `Result`
+/// conversion. Registered once on the template and reused by every clone.
+fn register_primitives(engine: &mut Engine) {
+    engine.register_fn("%source", |iri: String| {
+        call(Verb::Source, iri, None, None, None)
     });
-    let tx = call_tx.clone();
-    engine.register_fn("%source-in", move |iri: String, input: String| {
-        call(&tx, Verb::Source, iri, Some(input), None, None)
+    engine.register_fn("%source-in", |iri: String, input: String| {
+        call(Verb::Source, iri, Some(input), None, None)
     });
-    let tx = call_tx.clone();
-    engine.register_fn("%sink", move |iri: String, content: String| {
-        call(&tx, Verb::Sink, iri, None, Some(content), None)
+    engine.register_fn("%sink", |iri: String, content: String| {
+        call(Verb::Sink, iri, None, Some(content), None)
     });
-    let tx = call_tx.clone();
-    engine.register_fn("%meta", move |iri: String| {
-        call(
-            &tx,
-            Verb::Meta,
-            iri,
-            None,
-            None,
-            Some("text/turtle".to_string()),
-        )
+    engine.register_fn("%meta", |iri: String| {
+        call(Verb::Meta, iri, None, None, Some("text/turtle".to_string()))
     });
-    let tx = call_tx.clone();
-    engine.register_fn("%meta-as", move |iri: String, as_type: String| {
-        call(&tx, Verb::Meta, iri, None, None, Some(as_type))
+    engine.register_fn("%meta-as", |iri: String, as_type: String| {
+        call(Verb::Meta, iri, None, None, Some(as_type))
     });
-    let tx = call_tx.clone();
-    engine.register_fn("%exists", move |iri: String| {
-        call(&tx, Verb::Exists, iri, None, None, None)
+    engine.register_fn("%exists", |iri: String| {
+        call(Verb::Exists, iri, None, None, None)
     });
-    let tx = call_tx.clone();
-    engine.register_fn("%delete", move |iri: String| {
-        call(&tx, Verb::Delete, iri, None, None, None)
+    engine.register_fn("%delete", |iri: String| {
+        call(Verb::Delete, iri, None, None, None)
     });
 }
 
-/// Send a `VerbCall` to the servicing loop and block until the reply — the
-/// synchronous face the Steel builtins call.
+/// Send a `VerbCall` to the current eval's servicing loop and block until the
+/// reply — the synchronous face the Steel builtins call. The servicing channel is
+/// read from [`CURRENT_TX`], so a builtin registered once on the shared template
+/// reaches whichever eval is running on this worker.
 fn call(
-    tx: &Sender<VerbCall>,
     verb: Verb,
     iri: String,
     input: Option<String>,
     content: Option<String>,
     as_type: Option<String>,
 ) -> std::result::Result<String, String> {
+    let tx = CURRENT_TX
+        .with(|slot| slot.borrow().clone())
+        .ok_or_else(|| "lisp: no active eval context".to_string())?;
     let (reply, reply_rx) = crossbeam_channel::bounded(1);
     tx.send(VerbCall {
         verb,
@@ -507,6 +616,63 @@ mod tests {
             .find(|a| a.verb == Verb::Source)
             .expect("Source action");
         assert_eq!(source.requires, vec![CAP_LISP.to_string()]);
+    }
+
+    // ---- amortized-engine isolation & stdlib ------------------------------
+
+    /// Assert that a bare identifier does NOT resolve to `forbidden` in a fresh
+    /// eval — i.e. a prior eval's `(define …)` did not leak. An unbound reference
+    /// is correct isolation whether Steel renders it as void (empty string) or
+    /// raises a free-identifier error; only the *leaked value* would be a bug.
+    fn assert_unbound(cap: &Capability, ident: &str, forbidden: &str) {
+        // An `Err` (free-identifier error) is also correct isolation; only an `Ok`
+        // rendering the forbidden value would be a leak.
+        if let Ok(rep) = try_eval(cap, ident) {
+            assert_ne!(
+                String::from_utf8(rep.bytes).unwrap(),
+                forbidden,
+                "`{ident}` leaked the value from a previous eval"
+            );
+        }
+    }
+
+    #[test]
+    fn a_define_does_not_leak_into_the_next_eval() {
+        // The crux of the warm-clone pool: each eval runs on a fresh clone of the
+        // template, so a global defined in one eval is invisible to the next. If a
+        // single shared engine (or a leaky rollback) were used, eval 2 would see 5.
+        let cap = lisp_cap();
+        assert_eq!(eval_ok(&cap, "(define leaked 5) leaked"), "5");
+        // A second eval that references `leaked` must NOT get 5.
+        assert_unbound(&cap, "leaked", "5");
+        // And the prelude's verbs survive into every clone (not rolled away).
+        assert_eq!(eval_ok(&cap, r#"(source "urn:test:ping")"#), "pong");
+    }
+
+    #[test]
+    fn stdlib_higher_order_functions_work() {
+        // The warm template is `new_sandboxed` (full stdlib), so `map`/`lambda`
+        // remain available — the amortization did not drop the prelude.
+        assert_eq!(
+            eval_ok(&lisp_cap(), "(map (lambda (x) (* x x)) (list 1 2 3))"),
+            "(1 4 9)"
+        );
+    }
+
+    #[test]
+    fn many_sequential_evals_reuse_the_pool_correctly() {
+        // Exercise pooled-worker reuse: repeated evals through the same warm worker
+        // must each be correct and isolated (no accumulated state).
+        let cap = lisp_cap();
+        for i in 0..25 {
+            assert_eq!(
+                eval_ok(&cap, &format!("(define n {i}) (* n 2)")),
+                format!("{}", i * 2)
+            );
+        }
+        // After 25 defines of `n`, a bare `n` is still unbound (never leaked the
+        // last value, 24).
+        assert_unbound(&cap, "n", "24");
     }
 
     #[test]
