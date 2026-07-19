@@ -45,7 +45,29 @@
 //! executor and lets `register_fn`'s `Send + Sync + 'static` closures avoid
 //! borrowing the (non-`'static`) invocation.
 //!
-//! Because an eval may `sink`/mutate, its result is **uncacheable**.
+//! ## Cacheability (opt-in, NetKernel-style)
+//!
+//! An eval is **uncacheable by default** — the safe posture, since a program may
+//! `sink`/mutate. A program opts THIS eval in with `(cacheable expr)` (permanently
+//! cacheable) or `(cacheable/ttl secs expr)` (cacheable for a max-age); both
+//! evaluate `expr` and return its value, marking the eval as their side effect.
+//! The opt-in is honoured only when it is *safe*:
+//!
+//! - **Mutation wins.** If any `Sink` or `Delete` verb was issued during the run,
+//!   the result is forced uncacheable regardless of the opt-in — you cannot cache a
+//!   side effect. (The verb contract decides this, not the sink's returned expiry.)
+//! - **Never fresher than its inputs.** The kernel already folds every
+//!   sub-request's expiry (`most_restrictive`) and golden threads onto the result
+//!   after `invoke` returns, so an opted-in `(cacheable (source volatile))` inherits
+//!   the source's volatility, and cutting a source's thread invalidates the cached
+//!   eval — for free. The module sets only the *author's* ceiling.
+//! - **`cacheable/ttl` needs a clock.** The max-age becomes an absolute
+//!   `Expiry::At(now + secs)` via the kernel's injected clock; a clockless kernel
+//!   declines to cache it (falls back to `Always`), mirroring ikigai-core.
+//!
+//! The opt-in reaches the async `invoke` side as a `CacheHint` control message on
+//! the same channel the verb builtins use (see [`WorkerMsg`]); a program with no
+//! `(cacheable …)` form leaves the default `Expiry::Always` untouched.
 //!
 //! ## Amortizing the engine (warm-clone pool)
 //!
@@ -79,8 +101,8 @@
 use async_trait::async_trait;
 use crossbeam_channel::{Receiver, Sender};
 use ikigai_core::{
-    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Invocation, Iri, ReprType,
-    Representation, Request, Result, Verb,
+    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Expiry, Invocation, Iri,
+    ReprType, Representation, Request, Result, Verb,
 };
 use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
@@ -119,6 +141,8 @@ const PRELUDE: &str = r#"
   (if (null? rest) (%meta iri) (%meta-as iri (car rest))))
 (define (exists iri) (%exists iri))
 (define (delete iri) (%delete iri))
+(define (cacheable x) (%cache-permanent) x)
+(define (cacheable/ttl secs x) (%cache-ttl secs) x)
 "#;
 
 /// The `urn:lisp:eval` endpoint: evaluate an s-expression whose builtins are the
@@ -171,7 +195,7 @@ impl Endpoint for LispEval {
         // capability and its golden threads fold into the result. `call_tx` is the
         // only sender for this eval — the worker drops it when the run finishes,
         // which is how the servicing loop below learns the eval is done.
-        let (call_tx, call_rx) = crossbeam_channel::unbounded::<VerbCall>();
+        let (call_tx, call_rx) = crossbeam_channel::unbounded::<WorkerMsg>();
         let (result_tx, result_rx) = crossbeam_channel::bounded::<Result<String>>(1);
 
         // Check out a warm worker (or spawn one if all are busy). Sending the job
@@ -184,14 +208,39 @@ impl Endpoint for LispEval {
             result_tx,
         });
 
+        // The two cacheability inputs, both observed here on the async side: whether
+        // any mutating verb ran, and the program's opt-in ceiling (if any). See
+        // [`decide_expiry`].
+        let mut mutated = false;
+        let mut author_expiry: Option<Expiry> = None;
+
         if sent.is_ok() {
             // `recv` returns `Err` once the worker finishes the run and drops the
-            // eval's `call_tx` — the loop's natural exit.
-            while let Ok(call) = call_rx.recv() {
-                let result = dispatch(inv, &call).await;
-                // The evaluator parked on this reply; a send failure only means it
-                // went away first, which the next `recv` will observe.
-                let _ = call.reply.send(result);
+            // eval's `call_tx` — the loop's natural exit. Both message kinds arrive
+            // on this one channel, in program order.
+            while let Ok(msg) = call_rx.recv() {
+                match msg {
+                    WorkerMsg::Verb(call) => {
+                        // A Sink/Delete makes the eval a side effect — track it here
+                        // from the VERB (before dispatch, so even a *denied* mutation
+                        // still forbids caching), not from the sink's returned expiry.
+                        if call.verb.is_mutating() {
+                            mutated = true;
+                        }
+                        let result = dispatch(inv, &call).await;
+                        // The evaluator parked on this reply; a send failure only means
+                        // it went away first, which the next `recv` will observe.
+                        let _ = call.reply.send(result);
+                    }
+                    WorkerMsg::Cache(hint) => {
+                        // An opt-in `(cacheable …)` / `(cacheable/ttl …)` ran. Resolve
+                        // its expiry (a ttl needs the kernel's clock) and fold it into
+                        // any earlier opt-in, most-restrictive.
+                        let e = hint.resolve(inv);
+                        author_expiry =
+                            Some(author_expiry.map_or(e, |prev| prev.most_restrictive(e)));
+                    }
+                }
             }
         }
 
@@ -201,8 +250,11 @@ impl Endpoint for LispEval {
         match result_rx.recv() {
             Ok(text) => {
                 check_in_worker(worker);
-                // Uncacheable: an eval may sink/mutate. (No `.cacheable()`.)
-                Ok(Representation::new(text_plain_utf8(), text?.into_bytes()))
+                // Opt-in cacheability, honoured only when safe (see [`decide_expiry`]).
+                // The kernel then folds every sub-request's expiry and golden threads
+                // onto this result, so it is never fresher than its inputs — for free.
+                let expiry = decide_expiry(mutated, author_expiry);
+                Ok(Representation::new(text_plain_utf8(), text?.into_bytes()).with_expiry(expiry))
             }
             Err(_) => Err(Error::Endpoint(
                 "lisp: evaluator thread panicked".to_string(),
@@ -223,7 +275,9 @@ impl Endpoint for LispEval {
                  `(meta iri [type])`, `(exists iri)`, `(delete iri)` — each issued back through \
                  the kernel carrying this eval's capability, so a denied verb surfaces as a \
                  catchable Steel error (`with-handler`), never a panic. Requires `urn:cap:lisp`; \
-                 the result is the last form's value as text. Uncacheable (an eval may mutate).",
+                 the result is the last form's value as text. Uncacheable by default; a program \
+                 opts in with `(cacheable expr)` / `(cacheable/ttl secs expr)`, honoured only when \
+                 no verb mutated and never fresher than the eval's own inputs.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -249,6 +303,57 @@ fn read_source<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
     match inv.inline_str("in") {
         Ok(src) => Ok(src),
         Err(_) => inv.inline_str("content"),
+    }
+}
+
+/// A message from the synchronous Steel side to the async servicing loop, over the
+/// eval's one channel. A [`Verb`](WorkerMsg::Verb) is a kernel sub-request the
+/// builtin parks on; a [`Cache`](WorkerMsg::Cache) is a fire-and-forget opt-in
+/// signal from a `(cacheable …)` form (no reply). One channel keeps every
+/// cacheability decision input on the `invoke` side, observed in program order.
+enum WorkerMsg {
+    /// A kernel verb sub-request (the builtin awaits the reply).
+    Verb(VerbCall),
+    /// The program opted this eval into caching (no reply expected).
+    Cache(CacheHint),
+}
+
+/// A program's caching opt-in, raised by a `(cacheable …)` builtin. Resolved to an
+/// [`Expiry`] on the async side, where the kernel's clock is reachable.
+enum CacheHint {
+    /// `(cacheable expr)` — permanently cacheable ([`Expiry::Never`]).
+    Permanent,
+    /// `(cacheable/ttl secs expr)` — cacheable for `secs` seconds. Becomes an
+    /// absolute [`Expiry::At`] via the kernel's clock.
+    Ttl(u64),
+}
+
+impl CacheHint {
+    /// The author's chosen expiry ceiling. A `Ttl` needs the kernel's injected
+    /// clock to turn a max-age into an absolute deadline; a clockless kernel cannot
+    /// evaluate a deadline, so it declines to cache (`Always`) rather than risk
+    /// serving forever — mirroring ikigai-core's clockless `At` behaviour.
+    fn resolve(&self, inv: &Invocation<'_>) -> Expiry {
+        match self {
+            CacheHint::Permanent => Expiry::Never,
+            CacheHint::Ttl(secs) => match inv.now() {
+                Some(now) => Expiry::At(now.plus_millis(secs.saturating_mul(1000))),
+                None => Expiry::Always,
+            },
+        }
+    }
+}
+
+/// The eval result's own expiry ceiling, from the two safety inputs. A mutating
+/// verb (Sink/Delete) forces `Always` regardless of any opt-in — you cannot cache a
+/// side effect. Otherwise the program's opt-in ceiling applies, defaulting to
+/// `Always` (uncacheable) when it never opted in. The kernel then meets this with
+/// the eval's dependency expiries, so the result is never fresher than its inputs.
+fn decide_expiry(mutated: bool, author_expiry: Option<Expiry>) -> Expiry {
+    if mutated {
+        Expiry::Always
+    } else {
+        author_expiry.unwrap_or(Expiry::Always)
     }
 }
 
@@ -293,7 +398,7 @@ async fn dispatch(inv: &Invocation<'_>, call: &VerbCall) -> std::result::Result<
 /// one-shot channel to return the rendered result (or a lisp/eval error).
 struct EvalJob {
     src: String,
-    call_tx: Sender<VerbCall>,
+    call_tx: Sender<WorkerMsg>,
     result_tx: Sender<Result<String>>,
 }
 
@@ -303,7 +408,7 @@ thread_local! {
     /// builtins read it at call time. A worker runs one eval at a time, so this is
     /// unambiguous — and it is what lets the builtins be registered once on a
     /// shared warm template yet route to the right (per-eval) servicing loop.
-    static CURRENT_TX: RefCell<Option<Sender<VerbCall>>> = const { RefCell::new(None) };
+    static CURRENT_TX: RefCell<Option<Sender<WorkerMsg>>> = const { RefCell::new(None) };
 }
 
 /// The pool of idle warm workers (each an alive thread owning one warm engine,
@@ -409,6 +514,26 @@ fn register_primitives(engine: &mut Engine) {
     engine.register_fn("%delete", |iri: String| {
         call(Verb::Delete, iri, None, None, None)
     });
+    // The opt-in signals: fire-and-forget cache hints (no reply). The Scheme
+    // `(cacheable …)` wrappers call these, then return the evaluated value.
+    engine.register_fn("%cache-permanent", || cache_hint(CacheHint::Permanent));
+    engine.register_fn("%cache-ttl", |secs: isize| {
+        // A negative max-age is meaningless; clamp to 0 (immediately stale) rather
+        // than wrapping to a huge deadline.
+        cache_hint(CacheHint::Ttl(secs.max(0) as u64))
+    });
+}
+
+/// Raise a caching opt-in for the current eval: send a [`CacheHint`] over its
+/// servicing channel. Fire-and-forget — the servicing loop folds it into the
+/// result's expiry; there is no reply to park on. A missing/closed channel is
+/// ignored (the loop has already decided). Returns `true` so the Scheme wrapper has
+/// a value to discard.
+fn cache_hint(hint: CacheHint) -> bool {
+    if let Some(tx) = CURRENT_TX.with(|slot| slot.borrow().clone()) {
+        let _ = tx.send(WorkerMsg::Cache(hint));
+    }
+    true
 }
 
 /// Send a `VerbCall` to the current eval's servicing loop and block until the
@@ -426,14 +551,14 @@ fn call(
         .with(|slot| slot.borrow().clone())
         .ok_or_else(|| "lisp: no active eval context".to_string())?;
     let (reply, reply_rx) = crossbeam_channel::bounded(1);
-    tx.send(VerbCall {
+    tx.send(WorkerMsg::Verb(VerbCall {
         verb,
         iri,
         input,
         content,
         as_type,
         reply,
-    })
+    }))
     .map_err(|_| "lisp: kernel channel closed".to_string())?;
     reply_rx
         .recv()
@@ -469,10 +594,30 @@ mod tests {
         let ping = FnEndpoint::new("ping", |_inv: &Invocation<'_>| {
             Ok(Representation::new(text_plain_utf8(), b"pong".to_vec()))
         });
+        // A permanently-cacheable source (`Expiry::Never`) and a volatile one
+        // (`Expiry::Always`, the default) — so a `(cacheable (source …))` can be
+        // shown to inherit its input's volatility.
+        let pure = FnEndpoint::new("pure", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(text_plain_utf8(), b"pure".to_vec()).cacheable())
+        });
+        let volatile = FnEndpoint::new("volatile", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(text_plain_utf8(), b"live".to_vec()))
+        });
+        // A cacheable source that declares a golden thread for its mutable state —
+        // to prove those threads flow onto a cached eval automatically (the module
+        // never sets threads; cutting this thread invalidates the eval that read it).
+        let threaded = FnEndpoint::new("threaded", |_inv: &Invocation<'_>| {
+            Ok(Representation::new(text_plain_utf8(), b"v1".to_vec())
+                .cacheable()
+                .depends_on("urn:test:threaded"))
+        });
         let space = ikigai_fn::space()
             .bind(Exact::new("urn:lisp:eval"), eval())
             .bind(Exact::new("urn:test:vault"), DenyingVault)
-            .bind(Exact::new("urn:test:ping"), ping);
+            .bind(Exact::new("urn:test:ping"), ping)
+            .bind(Exact::new("urn:test:pure"), pure)
+            .bind(Exact::new("urn:test:volatile"), volatile)
+            .bind(Exact::new("urn:test:threaded"), threaded);
         Kernel::new(Arc::new(space))
     }
 
@@ -675,11 +820,149 @@ mod tests {
         assert_unbound(&cap, "n", "24");
     }
 
+    // ---- cacheability: opt-in, mutation-safe, never fresher than inputs ----
+
+    /// A capability that also grants `urn:cap:test:write`, so the vault sink
+    /// *succeeds* (exercising an ALLOWED mutation, not just a denied one).
+    fn writing_cap() -> Capability {
+        Capability::scoped(["urn:cap:lisp", "urn:cap:test:write"])
+    }
+
+    /// A fixed clock, so a `cacheable/ttl` deadline is deterministic.
+    struct FixedClock(u64);
+    impl ikigai_core::Clock for FixedClock {
+        fn now(&self) -> ikigai_core::Time {
+            ikigai_core::Time::from_millis(self.0)
+        }
+    }
+
     #[test]
-    fn eval_result_is_uncacheable() {
-        use ikigai_core::Expiry;
-        // An eval may mutate — its representation must never be cached.
+    fn no_opt_in_stays_uncacheable() {
+        // Rule 3 (default): without `(cacheable …)`, the result keeps the safe
+        // `Always` default — a plain eval may mutate.
         let rep = try_eval(&lisp_cap(), "(+ 1 2)").unwrap();
         assert_eq!(rep.expiry, Expiry::Always);
+    }
+
+    #[test]
+    fn opt_in_makes_a_pure_eval_permanently_cacheable() {
+        // Rule: `(cacheable expr)` on a pure eval → `Never`.
+        let rep = try_eval(&lisp_cap(), "(cacheable (+ 1 2))").unwrap();
+        assert_eq!(rep.expiry, Expiry::Never);
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "3"); // still returns expr's value
+    }
+
+    #[test]
+    fn a_cacheable_eval_is_served_from_the_cache_on_re_resolution() {
+        // The opt-in genuinely participates in the kernel cache: a second identical
+        // resolve of a `(cacheable …)` eval is a HIT (one kernel across both issues).
+        let k = kernel();
+        let cap = lisp_cap();
+        let req = || {
+            Request::new(Verb::Source, Iri::parse("urn:lisp:eval").unwrap())
+                .with_arg("in", ArgRef::Inline(b"(cacheable (+ 1 2))".to_vec()))
+        };
+        assert!(!k.is_cached(&req(), &cap), "not cached before first issue");
+        assert_eq!(
+            String::from_utf8(block_on(k.issue(req(), &cap)).unwrap().bytes).unwrap(),
+            "3"
+        );
+        assert!(
+            k.is_cached(&req(), &cap),
+            "a cacheable eval is cached after the first resolve"
+        );
+    }
+
+    #[test]
+    fn a_denied_mutation_forces_uncacheable_despite_opt_in() {
+        // Rule (mutation wins): a Sink was issued — even though DENIED and caught —
+        // so the opt-in is ignored and the result stays `Always`.
+        let rep = try_eval(
+            &lisp_cap(),
+            r#"(cacheable (with-handler (lambda (e) "caught") (sink "urn:test:vault" "x")))"#,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(rep.bytes.clone()).unwrap(), "caught");
+        assert_eq!(rep.expiry, Expiry::Always, "a mutation forbids caching");
+    }
+
+    #[test]
+    fn an_allowed_mutation_forces_uncacheable_despite_opt_in() {
+        // Rule (mutation wins), the stronger case: the sink SUCCEEDS (write grant),
+        // a real side effect — the opt-in is still ignored, result `Always`.
+        let rep = try_eval(&writing_cap(), r#"(cacheable (sink "urn:test:vault" "x"))"#).unwrap();
+        assert_eq!(String::from_utf8(rep.bytes.clone()).unwrap(), "stored");
+        assert_eq!(
+            rep.expiry,
+            Expiry::Always,
+            "a successful write forbids caching"
+        );
+    }
+
+    #[test]
+    fn opt_in_over_a_pure_source_stays_never() {
+        // A cacheable source under the opt-in → still `Never` (both permanent).
+        let rep = try_eval(&lisp_cap(), r#"(cacheable (source "urn:test:pure"))"#).unwrap();
+        assert_eq!(rep.expiry, Expiry::Never);
+    }
+
+    #[test]
+    fn opt_in_over_a_volatile_source_inherits_its_volatility() {
+        // Rule (never fresher than inputs): the SAME opt-in over a volatile source
+        // (`Always`) is clamped by the kernel's dependency fold to `Always`, NOT the
+        // `Never` the author asked for. Contrast with `opt_in_over_a_pure_source…`.
+        let rep = try_eval(&lisp_cap(), r#"(cacheable (source "urn:test:volatile"))"#).unwrap();
+        assert_eq!(
+            rep.expiry,
+            Expiry::Always,
+            "a cacheable eval is no fresher than its most volatile input"
+        );
+    }
+
+    #[test]
+    fn ttl_opt_in_with_a_clock_yields_a_deadline() {
+        // Rule: `(cacheable/ttl secs expr)` under a kernel WITH a clock → `At(now + secs)`.
+        let space = ikigai_fn::space().bind(Exact::new("urn:lisp:eval"), eval());
+        let k = Kernel::new(Arc::new(space)).with_clock(Arc::new(FixedClock(1_000)));
+        let req = Request::new(Verb::Source, Iri::parse("urn:lisp:eval").unwrap()).with_arg(
+            "in",
+            ArgRef::Inline(b"(cacheable/ttl 300 (+ 1 2))".to_vec()),
+        );
+        let rep = block_on(k.issue(req, &lisp_cap())).unwrap();
+        // now = 1000 ms, +300 s = +300_000 ms → deadline 301_000.
+        assert_eq!(
+            rep.expiry,
+            Expiry::At(ikigai_core::Time::from_millis(301_000))
+        );
+    }
+
+    #[test]
+    fn ttl_opt_in_without_a_clock_declines_to_cache() {
+        // Rule: a clockless kernel cannot evaluate a deadline, so a `cacheable/ttl`
+        // opt-in falls back to `Always` rather than risk serving forever.
+        let rep = try_eval(&lisp_cap(), "(cacheable/ttl 300 (+ 1 2))").unwrap();
+        assert_eq!(rep.expiry, Expiry::Always);
+    }
+
+    #[test]
+    fn cutting_a_sourced_thread_invalidates_the_cached_eval() {
+        // Threads stay AUTOMATIC: the module never sets threads, yet the golden
+        // thread declared by a sourced resource flows onto the cached eval via the
+        // kernel's dependency union — so cutting it invalidates the eval that read it.
+        let k = kernel();
+        let cap = lisp_cap();
+        let req = || {
+            Request::new(Verb::Source, Iri::parse("urn:lisp:eval").unwrap()).with_arg(
+                "in",
+                ArgRef::Inline(b"(cacheable (source \"urn:test:threaded\"))".to_vec()),
+            )
+        };
+        block_on(k.issue(req(), &cap)).unwrap();
+        assert!(k.is_cached(&req(), &cap), "cached after first resolve");
+        k.cut("urn:test:threaded");
+        assert!(
+            !k.is_cached(&req(), &cap),
+            "cutting the sourced resource's thread invalidated the cached eval"
+        );
     }
 }
