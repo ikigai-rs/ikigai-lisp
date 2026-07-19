@@ -1,0 +1,33 @@
+[package]
+name = "ikigai-lisp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
+authors = ["Brian Sletten <brian.sletten@gmail.com>"]
+repository = "https://github.com/ikigai-rs/ikigai-lisp"
+homepage = "https://github.com/ikigai-rs/ikigai-lisp"
+readme = "README.md"
+keywords = ["ikigai", "roc", "lisp", "scheme", "capability"]
+categories = ["compilers", "caching"]
+
+[dependencies]
+# The released kernel, consumed from crates.io — the SAME version the hosts use,
+# so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
+# 0.1.46 carries the typed `Error::Denied` variant a builtin surfaces on a
+# capability-denied sub-request.
+ikigai-core = "0.1.46"
+async-trait = "0.1"
+# The Scheme engine. Each eval builds a fresh `Engine`; its builtins are the
+# kernel verbs. 0.8 is the current embedding API (`Engine::run`, `register_fn`).
+steel-core = "0.8.2"
+# A Send + Sync channel pair (std::mpsc's Receiver is !Sync, which `register_fn`'s
+# Send+Sync+'static bound rejects). Bridges the synchronous Steel evaluator —
+# which runs on its own thread — to the async kernel driving sub-requests.
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+futures = "0.3" # block_on for the async tests
+# A real sibling module, so the `(source "urn:fn:toUpper" …)` oracle proves
+# verb-as-function across a genuine module boundary, not a local stub.
+ikigai-fn = "0.1.2"

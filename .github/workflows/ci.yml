@@ -1,0 +1,28 @@
+# CI for ikigai-lisp (`urn:lisp:eval`). A native-only module: the Steel engine is
+# bridged to the async kernel over an OS thread, so slice 1 exposes no wasm face —
+# hence no wasm-lib job (unlike the pure-Rust `ikigai-fn`/`ikigai-text` modules).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (all targets)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
