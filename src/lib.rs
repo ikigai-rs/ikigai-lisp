@@ -52,6 +52,35 @@
 //! verb wiring. An unknown head or malformed term is a clear, catchable error —
 //! never a panic (a compile error is mapped at the builtin boundary).
 //!
+//! ## Reaching every endpoint — `(invoke …)` and `(graph …)`
+//!
+//! The friendly `(source iri [input])` / `(sink iri content)` wrappers carry the
+//! ONE conventional argument each verb usually needs — the 93% case. But many
+//! actions take *named* arguments (`key=` for signing, `into=`/`type=` for key
+//! generation, `graph=` for a scoped query), and a single positional input can't
+//! reach them. `(invoke …)` closes that gap: it is the **general verb**, taking a
+//! verb, an IRI, and trailing `"name" value` pairs, so a Lisp program can drive
+//! *any* action the substrate offers, not just the single-input ones —
+//!
+//! ```text
+//! (invoke 'source "urn:sign:sign" "in" msg "key" "urn:secret:signing-key")
+//! (invoke 'source "urn:secret:generate" "into" "signing-key" "type" "ed25519")
+//! ```
+//!
+//! The verb is carried through unchanged, so a `(invoke 'sink …)` / `(invoke
+//! 'delete …)` still forbids caching exactly as the plain wrappers do. Names may be
+//! strings or symbols (`'in`), values strings/symbols/integers; an unpaired name or
+//! an unknown verb is a catchable error, never a panic.
+//!
+//! `(graph GRAPH-SEXPR)` is the graph-authoring dual of `(sparql-select …)`: it
+//! adapts a quoted `(graph …)` s-expression onto the neutral `Sexpr` and compiles
+//! it to canonical RDF **Turtle** with the same pure `ikigai_sexpr::sexpr_to_turtle`
+//! the `urn:rdf:from-sexpr` transreptor uses — so the datum is portable between the
+//! two. It is a pure transform (nothing to issue): the Turtle string it returns is
+//! then `(sink …)`-able, signable, or diffable. Composed, never string-built —
+//! ``(graph `(graph ,@triples))`` splices patterns with quasiquote, and a term can
+//! never break out to inject syntax.
+//!
 //! ## The two capability layers
 //!
 //! 1. **`urn:cap:lisp`** gates "may run arbitrary Lisp at all." It is declared on
@@ -173,6 +202,8 @@ const PRELUDE: &str = r#"
 (define (cacheable x) (%cache-permanent) x)
 (define (cacheable/ttl secs x) (%cache-ttl secs) x)
 (define (sparql-select query) (%sparql-select query))
+(define (invoke verb iri . pairs) (%verb-args (symbol->string verb) iri pairs))
+(define (graph g) (%graph g))
 "#;
 
 /// The `urn:lisp:eval` endpoint: evaluate an s-expression whose builtins are the
@@ -304,10 +335,13 @@ impl Endpoint for LispEval {
                  cap-scoped kernel verbs — `(source iri [input])`, `(sink iri content)`, \
                  `(meta iri [type])`, `(exists iri)`, `(delete iri)` — each issued back through \
                  the kernel carrying this eval's capability, so a denied verb surfaces as a \
-                 catchable Steel error (`with-handler`), never a panic. Requires `urn:cap:lisp`; \
-                 the result is the last form's value as text. Uncacheable by default; a program \
-                 opts in with `(cacheable expr)` / `(cacheable/ttl secs expr)`, honoured only when \
-                 no verb mutated and never fresher than the eval's own inputs.",
+                 catchable Steel error (`with-handler`), never a panic. `(invoke 'verb iri \
+                 \"name\" val …)` reaches any endpoint's named arguments (e.g. `key=`); \
+                 `(sparql-select …)` and `(graph …)` compose SPARQL/Turtle homoiconically. \
+                 Requires `urn:cap:lisp`; the result is the last form's value as text. \
+                 Uncacheable by default; a program opts in with `(cacheable expr)` / \
+                 `(cacheable/ttl secs expr)`, honoured only when no verb mutated and never \
+                 fresher than the eval's own inputs.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -388,18 +422,15 @@ fn decide_expiry(mutated: bool, author_expiry: Option<Expiry>) -> Expiry {
 }
 
 /// One verb invocation the Steel side asks the kernel to perform, with a reply
-/// channel the builtin parks on. `input` fills a Source target's conventional `in`;
-/// `content` is a Sink body; `as_type` is a Meta representation request.
+/// channel the builtin parks on. `args` are the named kernel arguments, in program
+/// order — `[("in", …)]` for a Source input, `[("content", …)]` for a Sink body,
+/// `[("as", …)]` for a Meta representation request, `[("query", …)]` for a compiled
+/// `(sparql-select …)`, or whatever name/value pairs an `(invoke …)` carries. A
+/// single general shape, so any endpoint's arguments are reachable from Lisp.
 struct VerbCall {
     verb: Verb,
     iri: String,
-    input: Option<String>,
-    content: Option<String>,
-    as_type: Option<String>,
-    /// A `query=` argument (the compiled SPARQL of a `(sparql-select …)`). Distinct
-    /// from `input`/`content` because `urn:sparql:select` reads its query from a
-    /// named `query` arg, not the conventional `in`/`content`.
-    query: Option<String>,
+    args: Vec<(String, String)>,
     reply: Sender<std::result::Result<String, String>>,
 }
 
@@ -411,17 +442,8 @@ async fn dispatch(inv: &Invocation<'_>, call: &VerbCall) -> std::result::Result<
     let iri =
         Iri::parse(&call.iri).map_err(|e| format!("lisp: invalid IRI `{}`: {e}", call.iri))?;
     let mut request = Request::new(call.verb, iri);
-    if let Some(input) = &call.input {
-        request = request.with_arg("in", ArgRef::Inline(input.clone().into_bytes()));
-    }
-    if let Some(content) = &call.content {
-        request = request.with_arg("content", ArgRef::Inline(content.clone().into_bytes()));
-    }
-    if let Some(as_type) = &call.as_type {
-        request = request.with_arg("as", ArgRef::Inline(as_type.clone().into_bytes()));
-    }
-    if let Some(query) = &call.query {
-        request = request.with_arg("query", ArgRef::Inline(query.clone().into_bytes()));
+    for (name, value) in &call.args {
+        request = request.with_arg(name.as_str(), ArgRef::Inline(value.clone().into_bytes()));
     }
     match inv.issue(request).await {
         Ok(repr) => String::from_utf8(repr.bytes)
@@ -530,27 +552,25 @@ fn render_value(value: &SteelVal) -> String {
 /// the reply — an `Err` reply becomes a catchable Steel error via Steel's `Result`
 /// conversion. Registered once on the template and reused by every clone.
 fn register_primitives(engine: &mut Engine) {
-    engine.register_fn("%source", |iri: String| {
-        call(Verb::Source, iri, None, None, None)
-    });
+    engine.register_fn("%source", |iri: String| call(Verb::Source, iri, Vec::new()));
     engine.register_fn("%source-in", |iri: String, input: String| {
-        call(Verb::Source, iri, Some(input), None, None)
+        call(Verb::Source, iri, vec![("in".to_string(), input)])
     });
     engine.register_fn("%sink", |iri: String, content: String| {
-        call(Verb::Sink, iri, None, Some(content), None)
+        call(Verb::Sink, iri, vec![("content".to_string(), content)])
     });
     engine.register_fn("%meta", |iri: String| {
-        call(Verb::Meta, iri, None, None, Some("text/turtle".to_string()))
+        call(
+            Verb::Meta,
+            iri,
+            vec![("as".to_string(), "text/turtle".to_string())],
+        )
     });
     engine.register_fn("%meta-as", |iri: String, as_type: String| {
-        call(Verb::Meta, iri, None, None, Some(as_type))
+        call(Verb::Meta, iri, vec![("as".to_string(), as_type)])
     });
-    engine.register_fn("%exists", |iri: String| {
-        call(Verb::Exists, iri, None, None, None)
-    });
-    engine.register_fn("%delete", |iri: String| {
-        call(Verb::Delete, iri, None, None, None)
-    });
+    engine.register_fn("%exists", |iri: String| call(Verb::Exists, iri, Vec::new()));
+    engine.register_fn("%delete", |iri: String| call(Verb::Delete, iri, Vec::new()));
     // The homoiconic SPARQL builtin: adapt the quoted `SteelVal` onto `ikigai-sexpr`'s
     // neutral `Sexpr` datum, compile it to a SPARQL SELECT with the pure, kernel-free
     // `ikigai_sexpr::sexpr_to_sparql`, and issue it as a Source `query=` to
@@ -561,7 +581,39 @@ fn register_primitives(engine: &mut Engine) {
         |query: SteelVal| -> std::result::Result<String, String> {
             let sexpr = steelval_to_sexpr(&query).map_err(|e| format!("{e}"))?;
             let sparql = ikigai_sexpr::sexpr_to_sparql(&sexpr).map_err(|e| format!("{e}"))?;
-            call_query("urn:sparql:select", sparql)
+            call(
+                Verb::Source,
+                "urn:sparql:select".to_string(),
+                vec![("query".to_string(), sparql)],
+            )
+        },
+    );
+    // The general named-argument verb: `(invoke 'verb iri "name" val …)`. Where the
+    // friendly `(source …)`/`(sink …)` wrappers carry one conventional argument (the
+    // 93% case), this reaches ANY endpoint's full argument surface — `key=` for
+    // signing, `into=`/`type=` for key generation, `graph=` for a scoped query — so
+    // a Lisp program can drive every action the substrate offers, not just the
+    // single-input ones. The flat trailing list is paired up name→value; the verb
+    // is carried, so a Sink/Delete issued this way still forbids caching.
+    engine.register_fn(
+        "%verb-args",
+        |verb: String, iri: String, args: SteelVal| -> std::result::Result<String, String> {
+            let verb = parse_verb(&verb)?;
+            let pairs = steelval_to_pairs(&args)?;
+            call(verb, iri, pairs)
+        },
+    );
+    // The homoiconic graph builtin: the graph-authoring dual of `(sparql-select …)`.
+    // Adapt the quoted `(graph …)` `SteelVal` onto the neutral `Sexpr` datum and
+    // compile it to canonical RDF **Turtle** with the pure, kernel-free
+    // `ikigai_sexpr::sexpr_to_turtle` — the SAME compiler the `urn:rdf:from-sexpr`
+    // transreptor uses, so the datum is portable between the two. Returns the Turtle
+    // text (a pure transform — nothing to issue), ready to `(sink …)`, sign, or diff.
+    engine.register_fn(
+        "%graph",
+        |g: SteelVal| -> std::result::Result<String, String> {
+            let sexpr = steelval_to_sexpr(&g).map_err(|e| format!("{e}"))?;
+            ikigai_sexpr::sexpr_to_turtle(&sexpr).map_err(|e| format!("{e}"))
         },
     );
     // The opt-in signals: fire-and-forget cache hints (no reply). The Scheme
@@ -587,15 +639,14 @@ fn cache_hint(hint: CacheHint) -> bool {
 }
 
 /// Send a `VerbCall` to the current eval's servicing loop and block until the
-/// reply — the synchronous face the Steel builtins call. The servicing channel is
+/// reply — the synchronous face every Steel verb builtin calls. `args` are the
+/// named kernel arguments (already coerced to strings). The servicing channel is
 /// read from [`CURRENT_TX`], so a builtin registered once on the shared template
 /// reaches whichever eval is running on this worker.
 fn call(
     verb: Verb,
     iri: String,
-    input: Option<String>,
-    content: Option<String>,
-    as_type: Option<String>,
+    args: Vec<(String, String)>,
 ) -> std::result::Result<String, String> {
     let tx = CURRENT_TX
         .with(|slot| slot.borrow().clone())
@@ -604,10 +655,7 @@ fn call(
     tx.send(WorkerMsg::Verb(VerbCall {
         verb,
         iri,
-        input,
-        content,
-        as_type,
-        query: None,
+        args,
         reply,
     }))
     .map_err(|_| "lisp: kernel channel closed".to_string())?;
@@ -616,28 +664,53 @@ fn call(
         .map_err(|_| "lisp: kernel dropped the reply".to_string())?
 }
 
-/// Send a Source sub-request carrying a `query=` argument (the compiled SPARQL of a
-/// `(sparql-select …)`) to the current eval's servicing loop, blocking on the reply.
-/// A thin sibling of [`call`] that routes through the same [`CURRENT_TX`] channel, so
-/// the query is issued under this eval's capability and composes like any verb.
-fn call_query(iri: &str, query: String) -> std::result::Result<String, String> {
-    let tx = CURRENT_TX
-        .with(|slot| slot.borrow().clone())
-        .ok_or_else(|| "lisp: no active eval context".to_string())?;
-    let (reply, reply_rx) = crossbeam_channel::bounded(1);
-    tx.send(WorkerMsg::Verb(VerbCall {
-        verb: Verb::Source,
-        iri: iri.to_string(),
-        input: None,
-        content: None,
-        as_type: None,
-        query: Some(query),
-        reply,
-    }))
-    .map_err(|_| "lisp: kernel channel closed".to_string())?;
-    reply_rx
-        .recv()
-        .map_err(|_| "lisp: kernel dropped the reply".to_string())?
+/// Map a verb name (from `(invoke 'source …)`, lowercased by convention) to its
+/// [`Verb`]. An unknown name is a clear, catchable error — never a panic.
+fn parse_verb(name: &str) -> std::result::Result<Verb, String> {
+    match name {
+        "source" => Ok(Verb::Source),
+        "sink" => Ok(Verb::Sink),
+        "meta" => Ok(Verb::Meta),
+        "exists" => Ok(Verb::Exists),
+        "delete" => Ok(Verb::Delete),
+        other => Err(format!(
+            "invoke: unknown verb `{other}` (use source/sink/meta/exists/delete)"
+        )),
+    }
+}
+
+/// Adapt a flat Steel list of alternating name/value terms — an `(invoke …)`'s
+/// trailing `pairs` — into named-argument pairs. Names and values are coerced to
+/// strings ([`coerce_arg`]). An odd length (a dangling name) or an unsupported term
+/// is a clear, catchable error, mapped to a Steel error at the builtin.
+fn steelval_to_pairs(value: &SteelVal) -> std::result::Result<Vec<(String, String)>, String> {
+    let list = match value {
+        SteelVal::ListV(list) => list,
+        _ => return Err("invoke: expected a list of name/value arguments".to_string()),
+    };
+    let flat: Vec<&SteelVal> = list.iter().collect();
+    if !flat.len().is_multiple_of(2) {
+        return Err(
+            "invoke: named arguments must come in name value pairs (dangling name)".to_string(),
+        );
+    }
+    let mut pairs = Vec::with_capacity(flat.len() / 2);
+    for pair in flat.chunks_exact(2) {
+        pairs.push((coerce_arg(pair[0])?, coerce_arg(pair[1])?));
+    }
+    Ok(pairs)
+}
+
+/// Coerce a Steel value used as an argument name or value into a string: a string is
+/// its raw contents, a symbol its text (so `'key` reads as a name), an integer its
+/// digits. Any other term is unsupported as an argument — a clear, catchable error.
+fn coerce_arg(value: &SteelVal) -> std::result::Result<String, String> {
+    match value {
+        SteelVal::StringV(s) => Ok(s.to_string()),
+        SteelVal::SymbolV(s) => Ok(s.to_string()),
+        SteelVal::IntV(n) => Ok(n.to_string()),
+        other => Err(format!("invoke: unsupported argument term {other}")),
+    }
 }
 
 // =====================================================================================
@@ -1179,6 +1252,136 @@ mod tests {
         // `with-handler` — the program recovers, no panic, no query issued.
         assert_eq!(
             sparql_eval_ok(r#"(with-handler (lambda (e) "caught") (sparql-select '(nonsense)))"#,),
+            "caught"
+        );
+    }
+
+    // ---- `(invoke …)` — the general named-argument verb ---------------------
+
+    #[test]
+    fn invoke_passes_a_named_argument_through_the_kernel() {
+        // `(invoke 'source iri "in" v)` reaches a real sibling module's `in` argument
+        // via the general path — the same result as the `(source iri v)` sugar, proving
+        // named args flow through unchanged.
+        assert_eq!(
+            eval_ok(
+                &lisp_cap(),
+                r#"(invoke 'source "urn:fn:toUpper" "in" "hi")"#
+            ),
+            "HI"
+        );
+    }
+
+    #[test]
+    fn invoke_accepts_symbol_argument_names() {
+        // Names may be symbols (`'in`), coerced to their text — the lispy surface.
+        assert_eq!(
+            eval_ok(&lisp_cap(), r#"(invoke 'source "urn:fn:toUpper" 'in "hi")"#),
+            "HI"
+        );
+    }
+
+    #[test]
+    fn invoke_carries_the_verb_so_a_sink_still_forbids_caching() {
+        // The verb is carried through the general path, so a mutating `(invoke 'sink …)`
+        // forces the eval uncacheable despite the `(cacheable …)` opt-in — exactly like
+        // the `(sink …)` wrapper. (The write succeeds under the write grant.)
+        let rep = try_eval(
+            &writing_cap(),
+            r#"(cacheable (invoke 'sink "urn:test:vault" "content" "x"))"#,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(rep.bytes.clone()).unwrap(), "stored");
+        assert_eq!(
+            rep.expiry,
+            Expiry::Always,
+            "a mutation via invoke still forbids caching"
+        );
+    }
+
+    #[test]
+    fn invoke_with_a_dangling_name_is_catchable() {
+        // An odd number of trailing terms (a name with no value) is a clear, catchable
+        // error — trapped by `with-handler`, never a panic, no sub-request issued.
+        assert_eq!(
+            eval_ok(
+                &lisp_cap(),
+                r#"(with-handler (lambda (e) "caught") (invoke 'source "urn:fn:toUpper" "in"))"#,
+            ),
+            "caught"
+        );
+    }
+
+    #[test]
+    fn invoke_with_an_unknown_verb_is_catchable() {
+        // An unrecognized verb name is a catchable error, not a panic.
+        assert_eq!(
+            eval_ok(
+                &lisp_cap(),
+                r#"(with-handler (lambda (e) "caught") (invoke 'frobnicate "urn:fn:toUpper" "in" "hi"))"#,
+            ),
+            "caught"
+        );
+    }
+
+    // ---- `(graph …)` — homoiconic Turtle authoring --------------------------
+
+    #[test]
+    fn graph_compiles_a_sexpr_to_turtle() {
+        // `(graph '(graph …))` compiles the graph-shaped s-expr to canonical Turtle
+        // in-process — a pure transform (no verb issued), so any kernel serves it.
+        let out = eval_ok(
+            &lisp_cap(),
+            r#"(graph '(graph
+                 (prefix (ex "http://example.org/") (foaf "http://xmlns.com/foaf/0.1/"))
+                 (ex:alice a foaf:Person)
+                 (ex:alice foaf:name "Alice")))"#,
+        );
+        assert!(
+            out.contains("@prefix ex: <http://example.org/> ."),
+            "expected the ex: prefix line, got: {out}"
+        );
+        assert!(
+            out.contains("ex:alice foaf:name \"Alice\" ."),
+            "expected the name triple, got: {out}"
+        );
+        assert!(
+            out.contains("ex:alice rdf:type foaf:Person ."),
+            "expected `a` to render as rdf:type, got: {out}"
+        );
+    }
+
+    #[test]
+    fn graph_composes_with_quasiquote() {
+        // Homoiconic composition: splicing triples (`,@…`) into a quasiquoted graph
+        // yields the SAME Turtle as writing them literally — built by composition,
+        // never string concatenation.
+        let prefixes = r#"(prefix (ex "http://example.org/") (foaf "http://xmlns.com/foaf/0.1/"))"#;
+        let literal = eval_ok(
+            &lisp_cap(),
+            &format!(
+                r#"(graph '(graph {prefixes} (ex:alice a foaf:Person) (ex:bob a foaf:Person)))"#
+            ),
+        );
+        let composed = eval_ok(
+            &lisp_cap(),
+            &format!(
+                r#"(define triples (list '(ex:alice a foaf:Person) '(ex:bob a foaf:Person)))
+                   (graph `(graph {prefixes} ,@triples))"#
+            ),
+        );
+        assert_eq!(composed, literal);
+    }
+
+    #[test]
+    fn a_bad_graph_sexpr_is_catchable_in_lisp() {
+        // A graph compile error (wrong head) is a catchable Steel error, trapped by
+        // `with-handler` — the program recovers, no panic.
+        assert_eq!(
+            eval_ok(
+                &lisp_cap(),
+                r#"(with-handler (lambda (e) "caught") (graph '(notgraph (ex:a ex:b ex:c))))"#,
+            ),
             "caught"
         );
     }

@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-lisp"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -18,11 +18,12 @@ categories = ["compilers", "caching"]
 # capability-denied sub-request.
 ikigai-core = "0.1.46"
 async-trait = "0.1"
-# The neutral s-expression foundation — owns the pure `sexpr_to_sparql` compiler
-# over its language-agnostic `Sexpr` datum (single source of truth). The
-# `(sparql-select …)` builtin adapts Steel's `SteelVal` into `Sexpr` and calls it,
-# rather than carrying its own inline copy of the compiler.
-ikigai-sexpr = "0.1.0"
+# The neutral s-expression foundation — owns the pure `sexpr_to_sparql` (query) and
+# `sexpr_to_turtle` (graph) compilers over its language-agnostic `Sexpr` datum (single
+# source of truth). The `(sparql-select …)` and `(graph …)` builtins adapt Steel's
+# `SteelVal` into `Sexpr` and call these, rather than carrying an inline compiler.
+# 0.1.1 introduced `sexpr_to_turtle`; pin 0.1.2 (the current published line).
+ikigai-sexpr = "0.1.2"
 # The Scheme engine; its builtins are the kernel verbs. 0.8 is the current
 # embedding API (`Engine::run`, `register_fn`). A warm `new_sandboxed` template
 # is built once per pooled worker and cloned per eval (~0.2 ms) — building a full

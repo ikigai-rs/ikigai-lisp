@@ -56,6 +56,42 @@ resource's thread invalidates the cached eval automatically.
 (sparql-select `(select (?name) (where (?s ,pred ?name))))   ; splice in a predicate
 ```
 
+## Reaching every endpoint — `(invoke …)`
+
+The `(source iri [input])` / `(sink iri content)` wrappers carry the one
+conventional argument each verb usually needs. `(invoke …)` is the **general
+verb**: it takes a verb, an IRI, and trailing `"name" value` pairs, so a program
+can drive *any* action's named arguments — not just the single-input ones:
+
+```text
+(invoke 'source "urn:sign:sign" "in" msg "key" "urn:secret:signing-key")
+(invoke 'source "urn:secret:generate" "into" "signing-key" "type" "ed25519")
+```
+
+Names may be strings or symbols (`'in`); the verb is carried through, so an
+`(invoke 'sink …)` / `(invoke 'delete …)` still forbids caching. A dangling name
+or an unknown verb is a catchable error, never a panic.
+
+## Homoiconic graphs — `(graph …)`
+
+`(graph GRAPH-SEXPR)` is the graph-authoring dual of `(sparql-select …)`: it
+compiles a `(graph …)` s-expression to canonical RDF **Turtle** (via
+[`ikigai-sexpr`](https://github.com/ikigai-rs/ikigai-sexpr)'s `sexpr_to_turtle` —
+the same compiler `urn:rdf:from-sexpr` uses, so the datum is portable). It is a
+pure transform; the returned Turtle is then `sink`-able, signable, or diffable:
+
+```text
+(graph '(graph
+  (prefix (ex "http://example.org/") (foaf "http://xmlns.com/foaf/0.1/"))
+  (ex:alice a foaf:Person)
+  (ex:alice foaf:name "Alice")))
+
+(graph `(graph ,prefixes ,@triples))   ; composed with quasiquote, never string-built
+```
+
+Composed with the verbs, a single program can mint a key, author a graph, sign
+it, and verify it — all homoiconically.
+
 ## Using it from a host
 
 ```rust,ignore
