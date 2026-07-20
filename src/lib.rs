@@ -30,10 +30,13 @@
 //! **quoted s-expression** describing a SELECT and runs it. The query is *composed,
 //! not string-built* — a Lisp list IS the query AST, so it splices with quasiquote
 //! (`` `(select ,vars (where ,@patterns)) ``) and never risks unsanitized
-//! interpolation. A pure, kernel-free compiler
-//! ([`sexpr_to_sparql`]) turns the s-expr into a SPARQL string; the builtin then
-//! issues it as an ordinary Source sub-request to `urn:sparql:select` (`query=`) —
-//! the SAME cap-scoped, composable path every verb uses. Grammar:
+//! interpolation. The query is compiled via the neutral **`ikigai-sexpr`** crate:
+//! a thin `steelval_to_sexpr` adapter maps the quoted `SteelVal` onto
+//! `ikigai-sexpr`'s language-agnostic [`Sexpr`] datum, then its
+//! pure, kernel-free [`sexpr_to_sparql`](ikigai_sexpr::sexpr_to_sparql) turns that
+//! into a SPARQL string; the builtin then issues it as an ordinary Source
+//! sub-request to `urn:sparql:select` (`query=`) — the SAME cap-scoped, composable
+//! path every verb uses. Grammar:
 //!
 //! ```text
 //! (select (?a ?b …) | *          ; projection: a var list, or * for all
@@ -44,9 +47,10 @@
 //!   (limit N))                    ; optional
 //! ```
 //!
-//! The compiler is deliberately self-contained (no eval/channel concerns), so a
-//! later slice can lift it verbatim into a language-agnostic transreptor. An
-//! unknown head or malformed term is a clear, catchable error — never a panic.
+//! The compiler now lives in `ikigai-sexpr` (a language-agnostic transreptor over
+//! a neutral `Sexpr`), so this crate carries only the Steel→`Sexpr` adapter and the
+//! verb wiring. An unknown head or malformed term is a clear, catchable error —
+//! never a panic (a compile error is mapped at the builtin boundary).
 //!
 //! ## The two capability layers
 //!
@@ -128,6 +132,7 @@ use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Expiry, Invocation, Iri,
     ReprType, Representation, Request, Result, Verb,
 };
+use ikigai_sexpr::Sexpr;
 use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 use steel::rvals::SteelVal;
@@ -546,13 +551,16 @@ fn register_primitives(engine: &mut Engine) {
     engine.register_fn("%delete", |iri: String| {
         call(Verb::Delete, iri, None, None, None)
     });
-    // The homoiconic SPARQL builtin: compile the quoted s-expr to a SPARQL SELECT
-    // (pure, kernel-free) and issue it as a Source `query=` to `urn:sparql:select`.
-    // A compile error becomes a catchable Steel error, exactly like a denied verb.
+    // The homoiconic SPARQL builtin: adapt the quoted `SteelVal` onto `ikigai-sexpr`'s
+    // neutral `Sexpr` datum, compile it to a SPARQL SELECT with the pure, kernel-free
+    // `ikigai_sexpr::sexpr_to_sparql`, and issue it as a Source `query=` to
+    // `urn:sparql:select`. An adapt or compile error becomes a catchable Steel error,
+    // exactly like a denied verb.
     engine.register_fn(
         "%sparql-select",
         |query: SteelVal| -> std::result::Result<String, String> {
-            let sparql = sexpr_to_sparql(&query).map_err(|e| format!("{e}"))?;
+            let sexpr = steelval_to_sexpr(&query).map_err(|e| format!("{e}"))?;
+            let sparql = ikigai_sexpr::sexpr_to_sparql(&sexpr).map_err(|e| format!("{e}"))?;
             call_query("urn:sparql:select", sparql)
         },
     );
@@ -633,379 +641,41 @@ fn call_query(iri: &str, query: String) -> std::result::Result<String, String> {
 }
 
 // =====================================================================================
-// The homoiconic SPARQL compiler — a pure `SteelVal` → `String`, kernel-free.
+// The Steel → `Sexpr` adapter — the ONLY compiler-side code this crate still owns.
 //
-// This is the reusable core of `(sparql-select …)`. It is deliberately free of any
-// eval, channel, capability or kernel concern, so a later slice can lift it verbatim
-// into a language-agnostic transreptor. Everything below is a total function of its
-// s-expression input: string literals and IRIs are escaped/validated (nothing is
-// interpolated raw), and any malformed input is a clear [`Error`] — never a panic.
+// The sexpr→SPARQL compiler now lives in `ikigai-sexpr` (single source of truth) over
+// its neutral, language-agnostic `Sexpr` datum. All this crate does is map the quoted
+// `SteelVal` the `(sparql-select …)` builtin receives onto that datum; the pure,
+// kernel-free `ikigai_sexpr::sexpr_to_sparql` does the rest. An unsupported Steel
+// variant is a clear, catchable error — mapped to a Steel error at the builtin, exactly
+// like a compile error or a denied verb — never a panic.
 // =====================================================================================
 
-/// Compile a quoted s-expression describing a SELECT into a SPARQL query string.
-///
-/// The accepted grammar is documented on the [crate] docs. The head symbol must be
-/// `select`; an unknown head, a malformed clause, or an unsupported term yields an
-/// `Err` the `(sparql-select …)` builtin surfaces as a catchable Steel error.
-pub fn sexpr_to_sparql(value: &SteelVal) -> Result<String> {
-    let items = list_items(value).ok_or_else(|| {
-        compile_err("query must be a list, e.g. (select (?s ?p ?o) (where (?s ?p ?o)))")
-    })?;
-    let head = items
-        .first()
-        .and_then(|v| symbol_name(v))
-        .ok_or_else(|| compile_err("query must start with a head symbol (e.g. `select`)"))?;
-    match head {
-        "select" => compile_select(&items[1..]),
-        other => Err(compile_err(&format!(
-            "unknown query head `{other}`; only `select` is supported"
+/// Adapt a Steel value into `ikigai-sexpr`'s neutral [`Sexpr`] datum: `ListV`→`List`,
+/// `SymbolV`→`Symbol`, `StringV`→`Str`, and an integer (`IntV`, or an integral `NumV`)
+/// →`Int`. Any other variant — including a non-integral/non-finite float — is an
+/// unsupported term, returned as an [`Error::Endpoint`] the `(sparql-select …)` builtin
+/// surfaces as a catchable Steel error. This is the whole seam between Steel's value
+/// model and the language-agnostic compiler.
+fn steelval_to_sexpr(value: &SteelVal) -> Result<Sexpr> {
+    match value {
+        SteelVal::ListV(list) => {
+            let mut items = Vec::with_capacity(list.len());
+            for v in list.iter() {
+                items.push(steelval_to_sexpr(v)?);
+            }
+            Ok(Sexpr::List(items))
+        }
+        SteelVal::SymbolV(s) => Ok(Sexpr::Symbol(s.to_string())),
+        SteelVal::StringV(s) => Ok(Sexpr::Str(s.to_string())),
+        SteelVal::IntV(n) => Ok(Sexpr::Int(*n as i64)),
+        // A float that happens to hold an integer value maps to `Int`; a fractional or
+        // non-finite float has no home in the neutral datum and is an unsupported term.
+        SteelVal::NumV(n) if n.is_finite() && n.fract() == 0.0 => Ok(Sexpr::Int(*n as i64)),
+        other => Err(Error::Endpoint(format!(
+            "sparql-select: unsupported term in query s-expr: {other}"
         ))),
     }
-}
-
-/// Compile the tail of a `(select …)` form: `PROJECTION CLAUSE…`, where PROJECTION is a
-/// var list or `*` and each CLAUSE is `where`/`prefix`/`limit`/`order-by`. Clauses may
-/// appear in any order; the emitted query always orders them canonically
-/// (PREFIX → SELECT/WHERE → ORDER BY → LIMIT).
-fn compile_select(rest: &[&SteelVal]) -> Result<String> {
-    let projection = rest.first().ok_or_else(|| {
-        compile_err("select needs a projection: (select (?a …) …) or (select * …)")
-    })?;
-    let proj = compile_projection(projection)?;
-
-    let mut prefixes: Vec<String> = Vec::new();
-    let mut where_triples: Vec<String> = Vec::new();
-    let mut limit: Option<String> = None;
-    let mut order_by: Option<String> = None;
-    let mut saw_where = false;
-
-    for clause in &rest[1..] {
-        let citems = list_items(clause)
-            .ok_or_else(|| compile_err("each select clause must be a list, e.g. (where …)"))?;
-        let chead = citems.first().and_then(|v| symbol_name(v)).ok_or_else(|| {
-            compile_err("a select clause must start with a keyword (where/prefix/limit/order-by)")
-        })?;
-        match chead {
-            "where" => {
-                saw_where = true;
-                for triple in &citems[1..] {
-                    where_triples.push(compile_triple(triple)?);
-                }
-            }
-            "prefix" => {
-                for binding in &citems[1..] {
-                    prefixes.push(compile_prefix(binding)?);
-                }
-            }
-            "limit" => limit = Some(compile_limit(&citems[1..])?),
-            "order-by" => order_by = Some(compile_order_by(&citems[1..])?),
-            other => {
-                return Err(compile_err(&format!(
-                    "unknown select clause `{other}`; expected where/prefix/limit/order-by"
-                )))
-            }
-        }
-    }
-    if !saw_where {
-        return Err(compile_err("select needs a (where …) clause"));
-    }
-
-    let mut out = String::new();
-    for line in &prefixes {
-        out.push_str(line);
-        out.push('\n');
-    }
-    out.push_str("SELECT ");
-    out.push_str(&proj);
-    out.push_str(" WHERE {");
-    for triple in &where_triples {
-        out.push_str("\n  ");
-        out.push_str(triple);
-    }
-    out.push_str("\n}");
-    if let Some(order) = &order_by {
-        out.push('\n');
-        out.push_str(order);
-    }
-    if let Some(lim) = &limit {
-        out.push('\n');
-        out.push_str(lim);
-    }
-    Ok(out)
-}
-
-/// The projection: `*` (a lone symbol) or a non-empty list of `?variables`.
-fn compile_projection(value: &SteelVal) -> Result<String> {
-    if symbol_name(value) == Some("*") {
-        return Ok("*".to_string());
-    }
-    let vars = list_items(value)
-        .ok_or_else(|| compile_err("projection must be a var list (?a ?b …) or *"))?;
-    if vars.is_empty() {
-        return Err(compile_err(
-            "projection var list is empty; use * to select all",
-        ));
-    }
-    let mut rendered = Vec::with_capacity(vars.len());
-    for v in vars {
-        rendered.push(render_var(v)?);
-    }
-    Ok(rendered.join(" "))
-}
-
-/// A single triple pattern `(S P O)` → `S P O .`. The predicate additionally accepts
-/// the bare symbol `a` (SPARQL's `rdf:type` keyword).
-fn compile_triple(value: &SteelVal) -> Result<String> {
-    let terms = list_items(value).ok_or_else(|| compile_err("a triple must be a list (S P O)"))?;
-    if terms.len() != 3 {
-        return Err(compile_err(
-            "a triple must have exactly three terms (S P O)",
-        ));
-    }
-    let s = render_term(terms[0])?;
-    let p = render_predicate(terms[1])?;
-    let o = render_term(terms[2])?;
-    Ok(format!("{s} {p} {o} ."))
-}
-
-/// A `(prefix (pfx "http://…") …)` binding → a `PREFIX pfx: <http://…>` line. The name
-/// may be written `pfx` or `pfx:` (the colon is added on emit).
-fn compile_prefix(value: &SteelVal) -> Result<String> {
-    let items = list_items(value)
-        .ok_or_else(|| compile_err("a prefix binding must be a list (pfx \"http://…\")"))?;
-    if items.len() != 2 {
-        return Err(compile_err("a prefix binding is (pfx \"http://…\")"));
-    }
-    let raw = symbol_name(items[0])
-        .ok_or_else(|| compile_err("prefix name must be a symbol, e.g. rdf"))?;
-    let pfx = raw.strip_suffix(':').unwrap_or(raw);
-    if !valid_pn_prefix(pfx) {
-        return Err(compile_err(&format!("invalid prefix name `{pfx}`")));
-    }
-    let iri = match items[1] {
-        SteelVal::StringV(s) => render_iri(s.as_str())?,
-        _ => return Err(compile_err("a prefix namespace must be a string IRI")),
-    };
-    Ok(format!("PREFIX {pfx}: {iri}"))
-}
-
-/// A `(limit N)` modifier — one non-negative integer.
-fn compile_limit(args: &[&SteelVal]) -> Result<String> {
-    if args.len() == 1 {
-        match args[0] {
-            SteelVal::IntV(n) if *n >= 0 => return Ok(format!("LIMIT {n}")),
-            SteelVal::IntV(_) => return Err(compile_err("limit must be a non-negative integer")),
-            _ => {}
-        }
-    }
-    Err(compile_err(
-        "limit takes a single non-negative integer, e.g. (limit 10)",
-    ))
-}
-
-/// An `(order-by ?v (desc ?w) …)` modifier — one or more conditions.
-fn compile_order_by(args: &[&SteelVal]) -> Result<String> {
-    if args.is_empty() {
-        return Err(compile_err("order-by needs at least one ?variable"));
-    }
-    let mut parts = Vec::with_capacity(args.len());
-    for arg in args {
-        parts.push(render_order_condition(arg)?);
-    }
-    Ok(format!("ORDER BY {}", parts.join(" ")))
-}
-
-/// One ORDER BY condition: a bare `?variable`, or `(asc ?v)` / `(desc ?v)`.
-fn render_order_condition(value: &SteelVal) -> Result<String> {
-    if let Some(s) = symbol_name(value) {
-        return if is_var(s) {
-            Ok(s.to_string())
-        } else {
-            Err(compile_err("order-by symbol must be a ?variable"))
-        };
-    }
-    let items = list_items(value)
-        .ok_or_else(|| compile_err("order-by term must be ?var or (asc ?var)/(desc ?var)"))?;
-    let keyword = match items.first().and_then(|v| symbol_name(v)) {
-        Some("asc") => "ASC",
-        Some("desc") => "DESC",
-        _ => return Err(compile_err("order-by direction must be asc or desc")),
-    };
-    if items.len() != 2 {
-        return Err(compile_err("(asc …)/(desc …) takes one ?variable"));
-    }
-    let var = render_var(items[1])?;
-    Ok(format!("{keyword}({var})"))
-}
-
-/// A term in subject/object position: `?var` | `(iri "…")` | `pfx:local` | string | number.
-fn render_term(value: &SteelVal) -> Result<String> {
-    match value {
-        SteelVal::SymbolV(s) => render_symbol_term(s.as_str()),
-        SteelVal::StringV(s) => Ok(render_string_literal(s.as_str())),
-        SteelVal::IntV(n) => Ok(n.to_string()),
-        SteelVal::NumV(n) => {
-            if n.is_finite() {
-                Ok(format!("{n}"))
-            } else {
-                Err(compile_err(
-                    "a non-finite number is not a valid SPARQL literal",
-                ))
-            }
-        }
-        SteelVal::ListV(list) => {
-            let items: Vec<&SteelVal> = list.iter().collect();
-            match items.first().and_then(|v| symbol_name(v)) {
-                Some("iri") => render_iri_form(&items[1..]),
-                Some(other) => Err(compile_err(&format!(
-                    "unknown term form `({other} …)`; only (iri \"…\") is a compound term"
-                ))),
-                None => Err(compile_err(
-                    "a compound term must start with a symbol, e.g. (iri \"…\")",
-                )),
-            }
-        }
-        _ => Err(compile_err(
-            "unsupported term; use ?var, (iri \"…\"), pfx:local, a string, or a number",
-        )),
-    }
-}
-
-/// A predicate term: like [`render_term`], but also accepting the bare `a` keyword.
-fn render_predicate(value: &SteelVal) -> Result<String> {
-    if symbol_name(value) == Some("a") {
-        return Ok("a".to_string());
-    }
-    render_term(value)
-}
-
-/// A symbol used as a term: either a `?variable` or a `pfx:local` prefixed name.
-fn render_symbol_term(s: &str) -> Result<String> {
-    if is_var(s) || is_prefixed_name(s) {
-        Ok(s.to_string())
-    } else {
-        Err(compile_err(&format!(
-            "unrecognized term symbol `{s}`; use ?var or pfx:local (full IRIs go in (iri \"…\"))"
-        )))
-    }
-}
-
-/// A `?variable` term, validated (only `?` + word characters) to keep it injection-safe.
-fn render_var(value: &SteelVal) -> Result<String> {
-    match symbol_name(value) {
-        Some(s) if is_var(s) => Ok(s.to_string()),
-        _ => Err(compile_err("expected a ?variable")),
-    }
-}
-
-/// The single-argument body of an `(iri "…")` compound term → a validated `<…>` IRIREF.
-fn render_iri_form(args: &[&SteelVal]) -> Result<String> {
-    if args.len() == 1 {
-        if let SteelVal::StringV(s) = args[0] {
-            return render_iri(s.as_str());
-        }
-    }
-    Err(compile_err(
-        "(iri …) takes exactly one string, e.g. (iri \"http://…\")",
-    ))
-}
-
-/// Wrap a validated IRI in `<…>`. Rejects any character illegal in a SPARQL IRIREF
-/// (angle brackets, quotes, braces, backslash, control chars, whitespace) — so a term
-/// can never break out of the IRIREF and inject query syntax.
-fn render_iri(iri: &str) -> Result<String> {
-    if iri.is_empty() {
-        return Err(compile_err("(iri \"\") is empty"));
-    }
-    if iri.chars().any(|c| {
-        c.is_control()
-            || matches!(
-                c,
-                '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' | ' '
-            )
-    }) {
-        return Err(compile_err(&format!(
-            "IRI `{iri}` contains characters not allowed in a SPARQL IRIREF"
-        )));
-    }
-    Ok(format!("<{iri}>"))
-}
-
-/// Render a Rust string as a SPARQL string literal, escaping the reserved characters
-/// so the literal cannot terminate early or inject syntax.
-fn render_string_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// The `SteelVal`s of a list, or `None` if it is not a list.
-fn list_items(value: &SteelVal) -> Option<Vec<&SteelVal>> {
-    match value {
-        SteelVal::ListV(list) => Some(list.iter().collect()),
-        _ => None,
-    }
-}
-
-/// The name of a symbol value, or `None` if it is not a symbol.
-fn symbol_name(value: &SteelVal) -> Option<&str> {
-    match value {
-        SteelVal::SymbolV(s) => Some(s.as_str()),
-        _ => None,
-    }
-}
-
-/// A SPARQL variable: `?` followed by one or more ASCII word characters.
-fn is_var(s: &str) -> bool {
-    let mut chars = s.chars();
-    if chars.next() != Some('?') {
-        return false;
-    }
-    let rest = chars.as_str();
-    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// A conservative prefixed name `pfx:local` — a valid prefix and a word-ish local part.
-fn is_prefixed_name(s: &str) -> bool {
-    match s.find(':') {
-        Some(idx) => valid_pn_prefix(&s[..idx]) && valid_pn_local(&s[idx + 1..]),
-        None => false,
-    }
-}
-
-/// A conservative SPARQL prefix label: empty (the default prefix) or a letter then
-/// letters/digits.
-fn valid_pn_prefix(pfx: &str) -> bool {
-    if pfx.is_empty() {
-        return true;
-    }
-    let mut chars = pfx.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric())
-}
-
-/// A conservative SPARQL local name: word characters and hyphens (may be empty).
-fn valid_pn_local(local: &str) -> bool {
-    local
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-/// A compile-time error from [`sexpr_to_sparql`], surfaced to the program as a catchable
-/// Steel error (identical treatment to a denied verb) — never a panic.
-fn compile_err(msg: &str) -> Error {
-    Error::Endpoint(format!("sparql-select: {msg}"))
 }
 
 #[cfg(test)]
@@ -1409,12 +1079,17 @@ mod tests {
         );
     }
 
-    // ---- the homoiconic SPARQL compiler (pure, kernel-free) ----------------
+    // ---- the Steel → `Sexpr` adapter --------------------------------------
+    //
+    // The sexpr→SPARQL compiler itself is `ikigai-sexpr`'s, tested there (string
+    // assertions, escaping/validation, malformed-input rejection). This crate now
+    // owns only the Steel→`Sexpr` seam, tested here; the end-to-end `(sparql-select …)`
+    // tests below prove the whole path (adapt → ikigai-sexpr compile → issue) unchanged.
 
     /// Read a Steel source form to the `SteelVal` the `(sparql-select …)` builtin
-    /// receives — i.e. the exact quoted-list value the real reader produces. Uses a
-    /// bare Steel engine, NOT the kernel: the compiler is proven kernel-free here.
-    fn parse(src: &str) -> SteelVal {
+    /// receives — the exact quoted value the real reader produces. A bare Steel engine,
+    /// NOT the kernel.
+    fn read_val(src: &str) -> SteelVal {
         Engine::new()
             .run(src.to_string())
             .expect("test s-expr must read")
@@ -1424,71 +1099,26 @@ mod tests {
     }
 
     #[test]
-    fn compiles_a_basic_select_with_one_triple() {
-        // The base case: a SELECT of three vars over a single triple pattern.
-        let q = parse("'(select (?s ?p ?o) (where (?s ?p ?o)))");
+    fn steelval_to_sexpr_maps_the_four_datum_kinds() {
+        // A quoted list carrying a symbol, a string, and an integer maps element-wise
+        // onto the neutral `Sexpr` datum (List/Symbol/Str/Int) — the whole adapter seam.
+        let val = read_val(r#"'(select ?s "x" 5)"#);
         assert_eq!(
-            sexpr_to_sparql(&q).unwrap(),
-            "SELECT ?s ?p ?o WHERE {\n  ?s ?p ?o .\n}"
+            steelval_to_sexpr(&val).unwrap(),
+            Sexpr::List(vec![
+                Sexpr::Symbol("select".to_string()),
+                Sexpr::Symbol("?s".to_string()),
+                Sexpr::Str("x".to_string()),
+                Sexpr::Int(5),
+            ])
         );
     }
 
     #[test]
-    fn compiles_prefix_projection_and_limit() {
-        // PREFIX line, a narrowed projection, a prefixed-name predicate, and LIMIT —
-        // emitted in canonical order regardless of clause order in the s-expr.
-        let q = parse(
-            r#"'(select (?s)
-                 (limit 5)
-                 (prefix (rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"))
-                 (where (?s rdf:type ?o)))"#,
-        );
-        assert_eq!(
-            sexpr_to_sparql(&q).unwrap(),
-            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-             SELECT ?s WHERE {\n  ?s rdf:type ?o .\n}\nLIMIT 5"
-        );
-    }
-
-    #[test]
-    fn compiles_star_projection_iri_term_and_order_by() {
-        // `*` projection, an (iri "…") subject, the `a` predicate keyword, and an
-        // ORDER BY mixing a bare var with a (desc …) condition.
-        let q = parse(
-            r#"'(select *
-                 (where ((iri "http://example.org/s") a ?o))
-                 (order-by ?o (desc ?o)))"#,
-        );
-        assert_eq!(
-            sexpr_to_sparql(&q).unwrap(),
-            "SELECT * WHERE {\n  <http://example.org/s> a ?o .\n}\nORDER BY ?o DESC(?o)"
-        );
-    }
-
-    #[test]
-    fn string_literals_and_iris_are_escaped_not_interpolated() {
-        // Safety is the point vs string-building: a literal's quotes/backslashes are
-        // escaped, and an IRI carrying query syntax is rejected outright (never emitted).
-        assert_eq!(render_string_literal("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
-        assert!(
-            render_iri("http://ex/x> . } INJECT {").is_err(),
-            "an IRI with IRIREF-illegal characters must be rejected"
-        );
-    }
-
-    #[test]
-    fn an_unknown_query_head_is_an_error_not_a_panic() {
-        // The required negative: an unknown head is a catchable `Err`, no panic.
-        assert!(sexpr_to_sparql(&parse("'(delete-everything)")).is_err());
-    }
-
-    #[test]
-    fn malformed_queries_are_rejected() {
-        // A non-list, an unknown clause, and a bad triple arity are all clean errors.
-        assert!(sexpr_to_sparql(&parse("42")).is_err());
-        assert!(sexpr_to_sparql(&parse("'(select (?s) (drop-table (?s ?p ?o)))")).is_err());
-        assert!(sexpr_to_sparql(&parse("'(select (?s) (where (?s ?p)))")).is_err());
-        assert!(sexpr_to_sparql(&parse("'(select (?s))")).is_err()); // no where clause
+    fn steelval_to_sexpr_rejects_an_unsupported_variant() {
+        // A boolean has no home in the neutral datum: a clear, catchable error (mapped
+        // to a Steel error at the builtin), never a panic.
+        assert!(steelval_to_sexpr(&read_val("#t")).is_err());
     }
 
     // ---- end-to-end: `(sparql-select …)` through a real SPARQL engine -------
