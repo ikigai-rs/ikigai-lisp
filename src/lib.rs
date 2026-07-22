@@ -204,6 +204,7 @@ const PRELUDE: &str = r#"
 (define (sparql-select query) (%sparql-select query))
 (define (invoke verb iri . pairs) (%verb-args (symbol->string verb) iri pairs))
 (define (graph g) (%graph g))
+(define (input) (%input))
 "#;
 
 /// The `urn:lisp:eval` endpoint: evaluate an s-expression whose builtins are the
@@ -249,78 +250,10 @@ impl Endpoint for LispEval {
         }
 
         let src = read_source(inv)?.to_string();
-
-        // Bridge the synchronous evaluator (a pooled worker thread with a warm
-        // engine) to the async kernel: a builtin sends a `VerbCall` and parks; we
-        // service each by issuing it, so the sub-request carries this invocation's
-        // capability and its golden threads fold into the result. `call_tx` is the
-        // only sender for this eval — the worker drops it when the run finishes,
-        // which is how the servicing loop below learns the eval is done.
-        let (call_tx, call_rx) = crossbeam_channel::unbounded::<WorkerMsg>();
-        let (result_tx, result_rx) = crossbeam_channel::bounded::<Result<String>>(1);
-
-        // Check out a warm worker (or spawn one if all are busy). Sending the job
-        // cannot fail: a pooled worker is alive (its `job_rx` sender is held here),
-        // and a freshly spawned one is too.
-        let worker = checkout_worker();
-        let sent = worker.send(EvalJob {
-            src,
-            call_tx,
-            result_tx,
-        });
-
-        // The two cacheability inputs, both observed here on the async side: whether
-        // any mutating verb ran, and the program's opt-in ceiling (if any). See
-        // [`decide_expiry`].
-        let mut mutated = false;
-        let mut author_expiry: Option<Expiry> = None;
-
-        if sent.is_ok() {
-            // `recv` returns `Err` once the worker finishes the run and drops the
-            // eval's `call_tx` — the loop's natural exit. Both message kinds arrive
-            // on this one channel, in program order.
-            while let Ok(msg) = call_rx.recv() {
-                match msg {
-                    WorkerMsg::Verb(call) => {
-                        // A Sink/Delete makes the eval a side effect — track it here
-                        // from the VERB (before dispatch, so even a *denied* mutation
-                        // still forbids caching), not from the sink's returned expiry.
-                        if call.verb.is_mutating() {
-                            mutated = true;
-                        }
-                        let result = dispatch(inv, &call).await;
-                        // The evaluator parked on this reply; a send failure only means
-                        // it went away first, which the next `recv` will observe.
-                        let _ = call.reply.send(result);
-                    }
-                    WorkerMsg::Cache(hint) => {
-                        // An opt-in `(cacheable …)` / `(cacheable/ttl …)` ran. Resolve
-                        // its expiry (a ttl needs the kernel's clock) and fold it into
-                        // any earlier opt-in, most-restrictive.
-                        let e = hint.resolve(inv);
-                        author_expiry =
-                            Some(author_expiry.map_or(e, |prev| prev.most_restrictive(e)));
-                    }
-                }
-            }
-        }
-
-        // A live worker sends exactly one result, then is safe to reuse. A worker
-        // that died mid-run (a Steel panic) drops `result_tx`, so `recv` errors —
-        // surface it as an endpoint error and let that worker go (do not re-pool).
-        match result_rx.recv() {
-            Ok(text) => {
-                check_in_worker(worker);
-                // Opt-in cacheability, honoured only when safe (see [`decide_expiry`]).
-                // The kernel then folds every sub-request's expiry and golden threads
-                // onto this result, so it is never fresher than its inputs — for free.
-                let expiry = decide_expiry(mutated, author_expiry);
-                Ok(Representation::new(text_plain_utf8(), text?.into_bytes()).with_expiry(expiry))
-            }
-            Err(_) => Err(Error::Endpoint(
-                "lisp: evaluator thread panicked".to_string(),
-            )),
-        }
+        // `data=` hands the program a value it reads via `(input)`, kept distinct from
+        // `src` — the seam a stored-program endpoint uses to pass a tuple as data, not code.
+        let input = inv.inline_str("data").ok().map(str::to_string);
+        run_eval(inv, src, input).await
     }
 
     fn name(&self) -> &str {
@@ -356,6 +289,140 @@ impl Endpoint for LispEval {
                     .summary("the Lisp dialect; only `steel` is available in slice 1")
                     .one_of([DIALECT_STEEL])
                     .default_value(DIALECT_STEEL),
+            )
+            .input(
+                ArgSpec::new("data")
+                    .optional()
+                    .summary(
+                        "optional value the program reads via `(input)` (distinct from the source)",
+                    )
+                    .class(XSD_STRING),
+            )
+            .output(TEXT_PLAIN_UTF8)
+    }
+}
+
+/// Run `src` on a warm worker under `inv`'s capability, with `input` reachable from the
+/// program via `(input)`. Shared by `urn:lisp:eval` and stored-program endpoints
+/// ([`LispProgram`]): a builtin sends a `VerbCall` and parks; we service each by issuing
+/// it, so every sub-request carries this invocation's capability and its golden threads
+/// fold into the result.
+async fn run_eval(
+    inv: &Invocation<'_>,
+    src: String,
+    input: Option<String>,
+) -> Result<Representation> {
+    // `call_tx` is the only sender for this eval — the worker drops it when the run
+    // finishes, which is how the servicing loop learns the eval is done.
+    let (call_tx, call_rx) = crossbeam_channel::unbounded::<WorkerMsg>();
+    let (result_tx, result_rx) = crossbeam_channel::bounded::<Result<String>>(1);
+
+    // Check out a warm worker (or spawn one if all are busy). Sending cannot fail: a
+    // pooled worker is alive (its `job_rx` sender is held here), a fresh one too.
+    let worker = checkout_worker();
+    let sent = worker.send(EvalJob {
+        src,
+        input,
+        call_tx,
+        result_tx,
+    });
+
+    // The two cacheability inputs, observed here on the async side: whether any mutating
+    // verb ran, and the program's opt-in ceiling (if any). See [`decide_expiry`].
+    let mut mutated = false;
+    let mut author_expiry: Option<Expiry> = None;
+
+    if sent.is_ok() {
+        // `recv` returns `Err` once the worker drops the eval's `call_tx` — the loop's
+        // natural exit. Both message kinds arrive on this one channel, in program order.
+        while let Ok(msg) = call_rx.recv() {
+            match msg {
+                WorkerMsg::Verb(call) => {
+                    // A Sink/Delete makes the eval a side effect — track it from the VERB
+                    // (before dispatch, so even a *denied* mutation still forbids caching).
+                    if call.verb.is_mutating() {
+                        mutated = true;
+                    }
+                    let result = dispatch(inv, &call).await;
+                    // The evaluator parked on this reply; a send failure only means it went
+                    // away first, which the next `recv` will observe.
+                    let _ = call.reply.send(result);
+                }
+                WorkerMsg::Cache(hint) => {
+                    // An opt-in `(cacheable …)` ran. Resolve its expiry (a ttl needs the
+                    // kernel's clock) and fold it into any earlier opt-in, most-restrictive.
+                    let e = hint.resolve(inv);
+                    author_expiry = Some(author_expiry.map_or(e, |prev| prev.most_restrictive(e)));
+                }
+            }
+        }
+    }
+
+    // A live worker sends exactly one result, then is safe to reuse. A worker that died
+    // mid-run (a Steel panic) drops `result_tx`, so `recv` errors — surface it and let
+    // that worker go (do not re-pool).
+    match result_rx.recv() {
+        Ok(text) => {
+            check_in_worker(worker);
+            let expiry = decide_expiry(mutated, author_expiry);
+            Ok(Representation::new(text_plain_utf8(), text?.into_bytes()).with_expiry(expiry))
+        }
+        Err(_) => Err(Error::Endpoint(
+            "lisp: evaluator thread panicked".to_string(),
+        )),
+    }
+}
+
+/// A stored Lisp program bound as an endpoint — **the program IS the endpoint**. Sourcing
+/// it runs the FIXED program (set at bind time) with the invocation's piped input reachable
+/// via `(input)`, so a reactor — or any caller — hands it DATA, never code. This is the
+/// seam that turns `schedule.scm` into `urn:booking:handle`. Requires `urn:cap:lisp`.
+pub struct LispProgram {
+    id: String,
+    program: String,
+}
+
+/// Bind a stored Lisp `program` as an endpoint named `id` (see [`LispProgram`]).
+pub fn program(id: impl Into<String>, program: impl Into<String>) -> LispProgram {
+    LispProgram {
+        id: id.into(),
+        program: program.into(),
+    }
+}
+
+#[async_trait]
+impl Endpoint for LispProgram {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_LISP) {
+            return Err(Error::Denied(format!(
+                "running a Lisp program requires the {CAP_LISP} capability"
+            )));
+        }
+        // The piped tuple/body is the program's DATA (via `(input)`), never its source.
+        let input = read_source(inv).ok().map(str::to_string);
+        run_eval(inv, self.program.clone(), input).await
+    }
+
+    fn name(&self) -> &str {
+        &self.id
+    }
+
+    fn describe(&self) -> Description {
+        Description::new(&self.id)
+            .title("Lisp program")
+            .summary(
+                "A stored Lisp program run as an endpoint. The piped input (a reactor's \
+                 tuple, a body) is DATA the program reads via `(input)`, never its source. \
+                 Requires `urn:cap:lisp`.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires(CAP_LISP)
+            .input(
+                ArgSpec::new("in")
+                    .optional()
+                    .summary("the data the program reads via `(input)` (piped/positional)")
+                    .class(XSD_STRING),
             )
             .output(TEXT_PLAIN_UTF8)
     }
@@ -457,6 +524,10 @@ async fn dispatch(inv: &Invocation<'_>, call: &VerbCall) -> std::result::Result<
 /// one-shot channel to return the rendered result (or a lisp/eval error).
 struct EvalJob {
     src: String,
+    /// The value the program reads via `(input)` — data handed to the program (a
+    /// reactor's tuple, a piped body), kept distinct from `src` so a stored program is
+    /// never fed its input as code.
+    input: Option<String>,
     call_tx: Sender<WorkerMsg>,
     result_tx: Sender<Result<String>>,
 }
@@ -468,6 +539,13 @@ thread_local! {
     /// unambiguous — and it is what lets the builtins be registered once on a
     /// shared warm template yet route to the right (per-eval) servicing loop.
     static CURRENT_TX: RefCell<Option<Sender<WorkerMsg>>> = const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// The `(input)` value of the eval currently running on THIS worker — the data a
+    /// program reads (a reactor's tuple, a piped body), distinct from its source. Set per
+    /// job by the worker, read by the `%input` primitive; a worker runs one eval at a time.
+    static CURRENT_INPUT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// The pool of idle warm workers (each an alive thread owning one warm engine,
@@ -505,13 +583,15 @@ fn check_in_worker(worker: Sender<EvalJob>) {
 fn worker_loop(job_rx: Receiver<EvalJob>) {
     let template = build_template();
     while let Ok(job) = job_rx.recv() {
-        // Install this eval's servicing channel for the builtins to reach.
+        // Install this eval's servicing channel + `(input)` data for the builtins to reach.
         CURRENT_TX.with(|slot| *slot.borrow_mut() = Some(job.call_tx));
+        CURRENT_INPUT.with(|slot| *slot.borrow_mut() = job.input);
         let mut engine = template.clone();
         let result = run_program(&mut engine, job.src);
         // Drop the eval's `call_tx` so the async servicing loop exits, THEN hand
         // back the result. (Dropping the clone here also releases its state.)
         CURRENT_TX.with(|slot| *slot.borrow_mut() = None);
+        CURRENT_INPUT.with(|slot| *slot.borrow_mut() = None);
         let _ = job.result_tx.send(result);
     }
 }
@@ -571,6 +651,11 @@ fn register_primitives(engine: &mut Engine) {
     });
     engine.register_fn("%exists", |iri: String| call(Verb::Exists, iri, Vec::new()));
     engine.register_fn("%delete", |iri: String| call(Verb::Delete, iri, Vec::new()));
+    // `(input)` — the data handed to this eval (empty string if none). Reads the
+    // per-job thread-local, so a stored program reaches its input without it being source.
+    engine.register_fn("%input", || {
+        CURRENT_INPUT.with(|slot| slot.borrow().clone().unwrap_or_default())
+    });
     // The homoiconic SPARQL builtin: adapt the quoted `SteelVal` onto `ikigai-sexpr`'s
     // neutral `Sexpr` datum, compile it to a SPARQL SELECT with the pure, kernel-free
     // `ikigai_sexpr::sexpr_to_sparql`, and issue it as a Source `query=` to
@@ -803,7 +888,12 @@ mod tests {
             .bind(Exact::new("urn:test:ping"), ping)
             .bind(Exact::new("urn:test:pure"), pure)
             .bind(Exact::new("urn:test:volatile"), volatile)
-            .bind(Exact::new("urn:test:threaded"), threaded);
+            .bind(Exact::new("urn:test:threaded"), threaded)
+            // A stored program bound as an endpoint: it reads its piped input as DATA.
+            .bind(
+                Exact::new("urn:test:echo-prog"),
+                program("echo-prog", r#"(string-append "got: " (input))"#),
+            );
         Kernel::new(Arc::new(space))
     }
 
@@ -839,6 +929,40 @@ mod tests {
             eval_ok(&lisp_cap(), r#"(source "urn:fn:toUpper" "hi")"#),
             "HI"
         );
+    }
+
+    #[test]
+    fn input_is_empty_without_data_but_reads_the_data_arg() {
+        // A bare eval has no `(input)` → empty string; `data=` supplies it, distinct from
+        // the program source (`in`).
+        assert_eq!(eval_ok(&lisp_cap(), "(input)"), "");
+        let request = Request::new(Verb::Source, Iri::parse("urn:lisp:eval").unwrap())
+            .with_arg(
+                "in",
+                ArgRef::Inline(b"(string-append \"hi \" (input))".to_vec()),
+            )
+            .with_arg("data", ArgRef::Inline(b"there".to_vec()));
+        let rep = block_on(kernel().issue(request, &lisp_cap())).unwrap();
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "hi there");
+    }
+
+    #[test]
+    fn a_stored_program_reads_its_piped_input_as_data() {
+        // The reactor's model: Source a bound program with the tuple as `content`; the
+        // FIXED program runs and reads it via `(input)` — data, never code.
+        let request = Request::new(Verb::Source, Iri::parse("urn:test:echo-prog").unwrap())
+            .with_arg("content", ArgRef::Inline(b"a booking".to_vec()));
+        let rep = block_on(kernel().issue(request, &lisp_cap())).unwrap();
+        assert_eq!(String::from_utf8(rep.bytes).unwrap(), "got: a booking");
+    }
+
+    #[test]
+    fn a_stored_program_requires_the_lisp_cap() {
+        let request = Request::new(Verb::Source, Iri::parse("urn:test:echo-prog").unwrap())
+            .with_arg("content", ArgRef::Inline(b"x".to_vec()));
+        let err = block_on(kernel().issue(request, &Capability::scoped(Vec::<String>::new())))
+            .unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "got: {err:?}");
     }
 
     #[test]
