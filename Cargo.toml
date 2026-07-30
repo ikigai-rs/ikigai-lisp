@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-lisp"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -33,9 +33,15 @@ steel-core = "0.8.2"
 # Send+Sync+'static bound rejects). Bridges the synchronous Steel evaluator —
 # which runs on its own thread — to the async kernel driving sub-requests.
 crossbeam-channel = "0.5"
+# Async channel pair for the eval's SERVICING side (worker sends sync, the async
+# loop awaits): the eval future must yield Pending — never block its thread — so
+# Timeout overlays and schedulers can act while a program runs.
+futures = "0.3"
 
 [dev-dependencies]
-futures = "0.3" # block_on for the async tests
+# The wall-clock Timeout overlay — proves the wire-eval L1 governor end to end:
+# the async servicing loop yields, so the racing timer actually fires mid-eval.
+ikigai-throttle = "0.1.6"
 # A real sibling module, so the `(source "urn:fn:toUpper" …)` oracle proves
 # verb-as-function across a genuine module boundary, not a local stub.
 ikigai-fn = "0.1.2"

@@ -157,6 +157,8 @@
 
 use async_trait::async_trait;
 use crossbeam_channel::{Receiver, Sender};
+use futures::channel::{mpsc, oneshot};
+use futures::StreamExt;
 use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Expiry, Invocation, Iri,
     ReprType, Representation, Request, Result, Verb,
@@ -314,9 +316,13 @@ async fn run_eval(
     input: Option<String>,
 ) -> Result<Representation> {
     // `call_tx` is the only sender for this eval — the worker drops it when the run
-    // finishes, which is how the servicing loop learns the eval is done.
-    let (call_tx, call_rx) = crossbeam_channel::unbounded::<WorkerMsg>();
-    let (result_tx, result_rx) = crossbeam_channel::bounded::<Result<String>>(1);
+    // finishes, which is how the servicing loop learns the eval is done. These two
+    // are ASYNC on the receiving side (the worker still sends synchronously): the
+    // servicing loop must yield `Pending` — never block its executor thread — so
+    // a wall-clock `Timeout` overlay racing this eval can actually fire, and so a
+    // scheduler worker is parked, not pinned, while the program runs.
+    let (call_tx, mut call_rx) = mpsc::unbounded::<WorkerMsg>();
+    let (result_tx, result_rx) = oneshot::channel::<Result<String>>();
 
     // Check out a warm worker (or spawn one, within the worker ceiling — at the
     // ceiling this is a typed transient refusal, the wire-eval compute governor's
@@ -336,9 +342,9 @@ async fn run_eval(
     let mut author_expiry: Option<Expiry> = None;
 
     if sent.is_ok() {
-        // `recv` returns `Err` once the worker drops the eval's `call_tx` — the loop's
+        // `next` yields `None` once the worker drops the eval's `call_tx` — the loop's
         // natural exit. Both message kinds arrive on this one channel, in program order.
-        while let Ok(msg) = call_rx.recv() {
+        while let Some(msg) = call_rx.next().await {
             match msg {
                 WorkerMsg::Verb(call) => {
                     // A Sink/Delete makes the eval a side effect — track it from the VERB
@@ -362,9 +368,9 @@ async fn run_eval(
     }
 
     // A live worker sends exactly one result, then is safe to reuse. A worker that died
-    // mid-run (a Steel panic) drops `result_tx`, so `recv` errors — surface it and let
-    // that worker go (do not re-pool).
-    match result_rx.recv() {
+    // mid-run (a Steel panic) drops `result_tx`, so the await cancels — surface it and
+    // let that worker go (do not re-pool).
+    match result_rx.await {
         Ok(text) => {
             check_in_worker(worker);
             let expiry = decide_expiry(mutated, author_expiry);
@@ -531,8 +537,8 @@ struct EvalJob {
     /// reactor's tuple, a piped body), kept distinct from `src` so a stored program is
     /// never fed its input as code.
     input: Option<String>,
-    call_tx: Sender<WorkerMsg>,
-    result_tx: Sender<Result<String>>,
+    call_tx: mpsc::UnboundedSender<WorkerMsg>,
+    result_tx: oneshot::Sender<Result<String>>,
 }
 
 thread_local! {
@@ -541,7 +547,8 @@ thread_local! {
     /// builtins read it at call time. A worker runs one eval at a time, so this is
     /// unambiguous — and it is what lets the builtins be registered once on a
     /// shared warm template yet route to the right (per-eval) servicing loop.
-    static CURRENT_TX: RefCell<Option<Sender<WorkerMsg>>> = const { RefCell::new(None) };
+    static CURRENT_TX: RefCell<Option<mpsc::UnboundedSender<WorkerMsg>>> =
+        const { RefCell::new(None) };
 }
 
 thread_local! {
@@ -785,7 +792,7 @@ fn register_primitives(engine: &mut Engine) {
 /// a value to discard.
 fn cache_hint(hint: CacheHint) -> bool {
     if let Some(tx) = CURRENT_TX.with(|slot| slot.borrow().clone()) {
-        let _ = tx.send(WorkerMsg::Cache(hint));
+        let _ = tx.unbounded_send(WorkerMsg::Cache(hint));
     }
     true
 }
@@ -804,13 +811,16 @@ fn call(
         .with(|slot| slot.borrow().clone())
         .ok_or_else(|| "lisp: no active eval context".to_string())?;
     let (reply, reply_rx) = crossbeam_channel::bounded(1);
-    tx.send(WorkerMsg::Verb(VerbCall {
+    // A send failure means the async side is GONE — the eval was dropped (e.g. a
+    // Timeout overlay elapsed). The catchable error unwinds the program, which is
+    // what lets a timed-out, verb-calling run release its worker back to the pool.
+    tx.unbounded_send(WorkerMsg::Verb(VerbCall {
         verb,
         iri,
         args,
         reply,
     }))
-    .map_err(|_| "lisp: kernel channel closed".to_string())?;
+    .map_err(|_| "lisp: eval cancelled (kernel channel closed)".to_string())?;
     reply_rx
         .recv()
         .map_err(|_| "lisp: kernel dropped the reply".to_string())?
