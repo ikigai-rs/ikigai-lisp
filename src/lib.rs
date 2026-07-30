@@ -510,7 +510,7 @@ impl Endpoint for SignedRun {
         // Gate 1a: the key must be one this host TRUSTS for code. A valid
         // signature by an un-enrolled key is still a refusal — trust is the
         // host's declaration, not the signer's.
-        if !self.trusted.iter().any(|k| *k == key) {
+        if !self.trusted.contains(&key) {
             return Err(Error::Denied(format!(
                 "key `{key}` is not in this host's code-signing trust set"
             )));
