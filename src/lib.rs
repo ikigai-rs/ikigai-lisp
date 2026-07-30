@@ -446,6 +446,150 @@ fn read_source<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
     }
 }
 
+/// The capability to SUBMIT a signed program for execution. Distinct from
+/// [`CAP_LISP`] (run arbitrary code): a ceiling can grant `urn:cap:lisp:run`
+/// without `urn:cap:lisp`, admitting only programs a trusted key vouches for.
+pub const CAP_LISP_RUN: &str = "urn:cap:lisp:run";
+
+/// `urn:lisp:run` — run a **signed** program: the portable-code envelope
+/// (wire-eval L1.5). Three independent gates, in order:
+///
+/// 1. **Origin**: the presented `key` IRI must be in this host's code-signing
+///    trust set (fixed at bind time), and the program bytes must verify against
+///    the RDF signature-graph via `urn:sign:verify` — issued THROUGH the kernel,
+///    so the key resolves as a resource and this module carries no crypto.
+///    Transport identity is NOT code provenance: the connection says who is
+///    connected, the signature says who authored — a forwarded or store-and-
+///    forwarded program (an intray drop has no connection at all) keeps its
+///    provenance.
+/// 2. **Authority**: the program evaluates under THIS invocation's capability —
+///    the signature gates what may RUN, the clamp gates what it may TOUCH.
+/// 3. **Compute**: the same worker ceiling and (on served surfaces) Timeout
+///    governor as `urn:lisp:eval`.
+///
+/// The signature covers the PROGRAM (`in`) only. Piped `content` (or `data=`) is
+/// the program's unsigned `(input)` DATA — data is data, never code: the same
+/// source/input separation [`LispProgram`] enforces.
+pub struct SignedRun {
+    /// The key IRIs whose signatures this host accepts for code.
+    trusted: Vec<String>,
+}
+
+/// Bind a `urn:lisp:run` accepting programs signed by any of `trusted` (public-
+/// key resource IRIs, e.g. `urn:file:keys/agent.pub`, resolved through the
+/// kernel at verify time).
+pub fn run_signed(trusted: impl IntoIterator<Item = impl Into<String>>) -> SignedRun {
+    SignedRun {
+        trusted: trusted.into_iter().map(Into::into).collect(),
+    }
+}
+
+#[async_trait]
+impl Endpoint for SignedRun {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        if !inv.capability.allows(CAP_LISP_RUN) {
+            return Err(Error::Denied(format!(
+                "submitting a signed program requires the {CAP_LISP_RUN} capability"
+            )));
+        }
+        // The PROGRAM must be explicit — a signed artifact is named, never
+        // ambiently piped (piped content is the program's DATA, below).
+        let program = inv
+            .inline_str("in")
+            .map_err(|_| Error::MissingArgument("in (the signed program)".to_string()))?
+            .to_string();
+        let sig = inv
+            .inline_str("sig")
+            .map_err(|_| Error::MissingArgument("sig (the RDF signature-graph)".to_string()))?
+            .to_string();
+        let key = inv
+            .inline_str("key")
+            .map_err(|_| Error::MissingArgument("key (the public-key resource IRI)".to_string()))?
+            .to_string();
+
+        // Gate 1a: the key must be one this host TRUSTS for code. A valid
+        // signature by an un-enrolled key is still a refusal — trust is the
+        // host's declaration, not the signer's.
+        if !self.trusted.contains(&key) {
+            return Err(Error::Denied(format!(
+                "key `{key}` is not in this host's code-signing trust set"
+            )));
+        }
+
+        // Gate 1b: verify the program bytes against the signature-graph, through
+        // the kernel (`urn:sign:verify` is open; the key resolves as a resource
+        // and folds its freshness into this invocation like any dependency).
+        let verify = Request::new(
+            Verb::Source,
+            Iri::parse("urn:sign:verify").expect("urn:sign:verify is a valid IRI"),
+        )
+        .with_arg("in", ArgRef::Inline(program.clone().into_bytes()))
+        .with_arg("sig", ArgRef::Inline(sig.into_bytes()))
+        .with_arg("key", ArgRef::Inline(key.clone().into_bytes()));
+        let verdict = inv.issue(verify).await?;
+        let verdict = String::from_utf8_lossy(&verdict.bytes).to_string();
+        if !verdict.starts_with("valid") {
+            return Err(Error::Denied(format!(
+                "program signature rejected ({key}): {verdict}"
+            )));
+        }
+
+        // Gates 2 + 3 live in run_eval: the session's capability bounds every
+        // sub-request; the worker ceiling (and any Timeout overlay fronting this
+        // binding) bounds compute. Piped/`data=` input is reachable via
+        // `(input)` — unsigned DATA, never evaluated.
+        let input = inv
+            .inline_str("data")
+            .or_else(|_| inv.inline_str("content"))
+            .ok()
+            .map(str::to_string);
+        run_eval(inv, program, input).await
+    }
+
+    fn name(&self) -> &str {
+        "lisp-run"
+    }
+
+    fn describe(&self) -> Description {
+        Description::new("lisp-run")
+            .title("Run a signed Lisp program")
+            .summary(
+                "Run a SIGNED program: `in` is the program, `sig` its RDF signature-graph, \
+                 `key` the public-key resource IRI — which must be in this host's code-signing \
+                 trust set, and whose signature must verify (via urn:sign:verify) before \
+                 anything evaluates. The signature gates what may run; the session capability \
+                 still gates what it may touch; the worker ceiling and any Timeout overlay \
+                 bound compute. Piped content (or data=) is the program's unsigned (input) \
+                 data, never code. Requires `urn:cap:lisp:run`.",
+            )
+            .verb(Verb::Source)
+            .verb(Verb::Meta)
+            .requires(CAP_LISP_RUN)
+            .input(
+                ArgSpec::new("in")
+                    .summary("the signed program source")
+                    .class(XSD_STRING),
+            )
+            .input(
+                ArgSpec::new("sig")
+                    .summary("the RDF signature-graph (Turtle) covering the program bytes")
+                    .class(XSD_STRING),
+            )
+            .input(
+                ArgSpec::new("key")
+                    .summary("the public-key resource IRI (must be in the host's trust set)")
+                    .class(XSD_STRING),
+            )
+            .input(
+                ArgSpec::new("data")
+                    .optional()
+                    .summary("unsigned data the program reads via `(input)` (or piped)")
+                    .class(XSD_STRING),
+            )
+            .output(TEXT_PLAIN_UTF8)
+    }
+}
+
 /// A message from the synchronous Steel side to the async servicing loop, over the
 /// eval's one channel. A [`Verb`](WorkerMsg::Verb) is a kernel sub-request the
 /// builtin parks on; a [`Cache`](WorkerMsg::Cache) is a fire-and-forget opt-in
