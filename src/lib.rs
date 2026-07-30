@@ -163,6 +163,7 @@ use ikigai_core::{
 };
 use ikigai_sexpr::Sexpr;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
@@ -317,9 +318,11 @@ async fn run_eval(
     let (call_tx, call_rx) = crossbeam_channel::unbounded::<WorkerMsg>();
     let (result_tx, result_rx) = crossbeam_channel::bounded::<Result<String>>(1);
 
-    // Check out a warm worker (or spawn one if all are busy). Sending cannot fail: a
-    // pooled worker is alive (its `job_rx` sender is held here), a fresh one too.
-    let worker = checkout_worker();
+    // Check out a warm worker (or spawn one, within the worker ceiling — at the
+    // ceiling this is a typed transient refusal, the wire-eval compute governor's
+    // thread bound). Sending cannot fail: a pooled worker is alive (its `job_rx`
+    // sender is held here), a fresh one too.
+    let worker = checkout_worker()?;
     let sent = worker.send(EvalJob {
         src,
         input,
@@ -550,23 +553,87 @@ thread_local! {
 
 /// The pool of idle warm workers (each an alive thread owning one warm engine,
 /// addressed by its job sender). A busy worker is simply absent from the pool;
-/// [`checkout_worker`] spawns a new one when none are idle, so nested and
-/// concurrent evals never block one another.
+/// [`checkout_worker`] spawns a new one when none are idle — up to the
+/// [`worker_ceiling`], the wire-eval compute governor's thread bound.
 static POOL: OnceLock<Mutex<Vec<Sender<EvalJob>>>> = OnceLock::new();
 
-/// Take an idle worker, or spawn a fresh warm one. The returned sender is the
-/// handle used to submit a job and (via [`check_in_worker`]) to return the worker.
-fn checkout_worker() -> Sender<EvalJob> {
+/// Live eval workers, idle AND busy — the count the ceiling bounds. Incremented
+/// at spawn; decremented when a worker thread exits (its guard drops), so a
+/// panicked-and-not-re-pooled worker releases its slot.
+static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Ceiling on concurrently-live eval workers (threads). Before this bound an
+/// unanswerable burst — or a runaway spawning nested evals — grew a thread per
+/// eval without limit (the resource-exhaustion finding from the 2026-07-21
+/// review, and a hard prerequisite for serving eval over the wire). Overridable
+/// via `IKIGAI_LISP_WORKERS` (min 1); the default is machine-fitness — the
+/// host's available parallelism, floored at 8 — so ordinary concurrency (a
+/// scheduler pool, a parallel test run) fits while a runaway still meets a
+/// bound instead of a thread per eval.
+fn worker_ceiling() -> usize {
+    static CEILING: OnceLock<usize> = OnceLock::new();
+    *CEILING.get_or_init(|| {
+        std::env::var("IKIGAI_LISP_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+                    .max(8)
+            })
+    })
+}
+
+/// Take an idle worker, or spawn a fresh warm one **within the ceiling**. At the
+/// ceiling the refusal is a typed, transient [`Error::Unavailable`] — so a
+/// caller's Retry/CircuitBreaker overlays engage, and a saturated pool degrades
+/// loudly instead of growing threads without bound. NB a NESTED eval (a program
+/// whose sub-request resolves another `urn:lisp:eval`) holds its own worker
+/// while needing a second: at ceiling 1 that nests into this refusal rather
+/// than deadlocking — the typed refusal is the designed behavior.
+fn checkout_worker() -> Result<Sender<EvalJob>> {
     let pool = POOL.get_or_init(|| Mutex::new(Vec::new()));
     if let Some(worker) = pool.lock().unwrap().pop() {
-        return worker;
+        return Ok(worker);
     }
-    // All warm workers are busy (or this is the first eval): spawn a new one. It
-    // builds its template once, then serves jobs until its `job_rx` sender is
-    // dropped (i.e. the worker is dropped instead of re-pooled).
+    // No idle worker: admit a new one only under the ceiling (CAS loop, so two
+    // racing checkouts can't both take the last slot).
+    let ceiling = worker_ceiling();
+    let mut live = LIVE_WORKERS.load(Ordering::Relaxed);
+    loop {
+        if live >= ceiling {
+            return Err(Error::Unavailable(format!(
+                "lisp: all {ceiling} eval workers are busy (transient — retry, or raise \
+                 IKIGAI_LISP_WORKERS)"
+            )));
+        }
+        match LIVE_WORKERS.compare_exchange_weak(
+            live,
+            live + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => live = current,
+        }
+    }
     let (job_tx, job_rx) = crossbeam_channel::unbounded::<EvalJob>();
-    std::thread::spawn(move || worker_loop(job_rx));
-    job_tx
+    std::thread::spawn(move || {
+        // Release the ceiling slot when this worker thread exits for any reason
+        // (all senders dropped, or an unwinding panic) — the guard's Drop runs
+        // either way, so a dead worker never leaks its slot.
+        struct Slot;
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _slot = Slot;
+        worker_loop(job_rx);
+    });
+    Ok(job_tx)
 }
 
 /// Return a worker to the idle pool for reuse. Only ever called for a worker that
