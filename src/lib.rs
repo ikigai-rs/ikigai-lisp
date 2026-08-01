@@ -805,12 +805,49 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
         CURRENT_TX.with(|slot| *slot.borrow_mut() = Some(job.call_tx));
         CURRENT_INPUT.with(|slot| *slot.borrow_mut() = job.input);
         let mut engine = template.clone();
-        let result = run_program(&mut engine, job.src);
+        // CATCH the panic here, where its payload still exists. A Steel VM panic used to
+        // kill the worker and drop `result_tx`, so the caller learned only "evaluator
+        // thread panicked" — true, useless, and identical for every cause.
+        //
+        // The one that matters in practice: calling a function defined in an EARLIER eval.
+        // Isolation is by design (each eval clones a pristine template, so no value leaks
+        // between them) but Steel's symbol interner is shared across clones, so the fresh
+        // clone knows the symbol's id and has no slot for it — an index out of bounds where
+        // `unbound identifier` belongs. That is a confusing failure to meet in a REPL, so
+        // it is named.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_program(&mut engine, job.src)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let detail = panic_message(&payload);
+                Err(Error::Endpoint(if detail.contains("index out of bounds") {
+                    "lisp: unbound identifier — each evaluation is isolated, so a \
+                     definition from an earlier one is not in scope. Put the definitions and \
+                     the call in the SAME program (e.g. transclude a prelude with \
+                     `$a{urn:lisp:aliases}`)."
+                        .to_string()
+                } else {
+                    format!("lisp: evaluator panicked: {detail}")
+                }))
+            }
+        };
         // Drop the eval's `call_tx` so the async servicing loop exits, THEN hand
         // back the result. (Dropping the clone here also releases its state.)
         CURRENT_TX.with(|slot| *slot.borrow_mut() = None);
         CURRENT_INPUT.with(|slot| *slot.borrow_mut() = None);
         let _ = job.result_tx.send(result);
+    }
+}
+
+/// The human-readable half of a panic payload, which is a `&str` or a `String`.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -1728,6 +1765,42 @@ mod tests {
                 r#"(with-handler (lambda (e) "caught") (graph '(notgraph (ex:a ex:b ex:c))))"#,
             ),
             "caught"
+        );
+    }
+    /// A Steel VM panic must reach the caller as an ERROR with a cause, not as
+    /// "evaluator thread panicked".
+    ///
+    /// The case that matters: calling a function defined in an EARLIER evaluation. Each
+    /// eval clones a pristine template — isolation by design, no values leak — but Steel's
+    /// symbol interner is shared across clones, so the fresh clone knows the symbol id and
+    /// has no slot for it. That surfaced as `index out of bounds`, which tells a REPL user
+    /// nothing about what they did.
+    #[test]
+    fn a_definition_from_an_earlier_eval_reports_isolation_not_a_panic() {
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), eval()),
+        ));
+        let run = |src: &str| {
+            block_on(
+                kernel.issue(
+                    Request::new(Verb::Source, Iri::parse("urn:lisp:eval").unwrap())
+                        .with_arg("content", ArgRef::Inline(src.as_bytes().to_vec())),
+                    &Capability::root(),
+                ),
+            )
+        };
+        // Define in one evaluation...
+        run("(define (foo x) x)").expect("the define itself is fine");
+        // ...and call it in the next.
+        let err = run("(foo 42)").expect_err("not in scope");
+        let text = err.to_string();
+        assert!(
+            text.contains("each evaluation is isolated"),
+            "must explain the isolation, got: {text}"
+        );
+        assert!(
+            !text.contains("thread panicked"),
+            "must not leak the panic wording: {text}"
         );
     }
 }
