@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-lisp"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -14,9 +14,9 @@ categories = ["compilers", "caching"]
 [dependencies]
 # The released kernel, consumed from crates.io — the SAME version the hosts use,
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
-# 0.1.46 carries the typed `Error::Denied` variant a builtin surfaces on a
-# capability-denied sub-request.
-ikigai-core = "0.1.46"
+# 0.1.50 carries `Invocation::scope_sync` + `SyncIssuer` — the sync-eval bridge
+# this crate proved privately, now consumed from core (the true minimum).
+ikigai-core = "0.1.50"
 async-trait = "0.1"
 # The neutral s-expression foundation — owns the pure `sexpr_to_sparql` (query) and
 # `sexpr_to_turtle` (graph) compilers over its language-agnostic `Sexpr` datum (single
@@ -29,16 +29,10 @@ ikigai-sexpr = "0.1.2"
 # is built once per pooled worker and cloned per eval (~0.2 ms) — building a full
 # VM per eval cost ~50 ms.
 steel-core = "0.8.2"
-# A Send + Sync channel pair (std::mpsc's Receiver is !Sync, which `register_fn`'s
-# Send+Sync+'static bound rejects). Bridges the synchronous Steel evaluator —
-# which runs on its own thread — to the async kernel driving sub-requests.
-crossbeam-channel = "0.5"
-# Async channel pair for the eval's SERVICING side (worker sends sync, the async
-# loop awaits): the eval future must yield Pending — never block its thread — so
-# Timeout overlays and schedulers can act while a program runs.
-futures = "0.3"
-
 [dev-dependencies]
+# Test executor (`block_on`, `now_or_never`) only — the sync↔async bridge itself
+# is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
+futures = "0.3"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
 # genuine urn:sign:verify (module composition, not a stub).
 ikigai-sign = "0.1.0"
