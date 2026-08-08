@@ -95,12 +95,15 @@
 //! ## How the synchronous evaluator reaches the async kernel
 //!
 //! Steel evaluates **synchronously** on its own thread, while the kernel issues
-//! sub-requests **asynchronously**. The two are bridged by a channel: a builtin
-//! sends its verb/target over a channel and parks on the reply; the async
-//! `invoke` task services each request by issuing it through the kernel (`await`)
-//! and sends the representation back. This keeps the module free of any nested
-//! executor and lets `register_fn`'s `Send + Sync + 'static` closures avoid
-//! borrowing the (non-`'static`) invocation.
+//! sub-requests **asynchronously**. The bridge is the kernel's own
+//! [`Invocation::scope_sync`]: the eval runs inside a sync scope holding a
+//! blocking [`SyncIssuer`], and every verb builtin calls `issuer.issue(…)` —
+//! parking its worker thread, never an executor — while the invocation services
+//! each sub-request on the async side. Capability attenuation, cache-dependency
+//! recording, and trace parentage are core's guarantees, exactly as if the
+//! endpoint had issued the sub-request itself. (This crate was the bridge's
+//! first consumer; the private channel plumbing it used to carry moved into
+//! core as `scope_sync`.)
 //!
 //! ## Cacheability (opt-in, NetKernel-style)
 //!
@@ -122,9 +125,10 @@
 //!   `Expiry::At(now + secs)` via the kernel's injected clock; a clockless kernel
 //!   declines to cache it (falls back to `Always`), mirroring ikigai-core.
 //!
-//! The opt-in reaches the async `invoke` side as a `CacheHint` control message on
-//! the same channel the verb builtins use (see [`WorkerMsg`]); a program with no
-//! `(cacheable …)` form leaves the default `Expiry::Always` untouched.
+//! The opt-in accumulates as a [`CacheHint`] in the worker's per-eval state and
+//! returns with the result, where the `invoke` side resolves it against the
+//! kernel's clock; a program with no `(cacheable …)` form leaves the default
+//! `Expiry::Always` untouched.
 //!
 //! ## Amortizing the engine (warm-clone pool)
 //!
@@ -148,24 +152,22 @@
 //! definitions survive into every clone while user state does not.
 //!
 //! Verb builtins are registered once on the template and reused by every clone,
-//! so they cannot capture a per-eval channel. Instead they read the **current
-//! eval's servicing channel from a thread-local** ([`CURRENT_TX`]), which the
-//! worker sets before each run and clears after. The eval's [`Capability`] is
-//! never on the worker at all: sub-requests are serviced back on the async
-//! `invoke` side under *that* invocation's capability, so per-eval attenuation
-//! is preserved unchanged.
+//! so they cannot capture a per-eval [`SyncIssuer`] clone directly. Instead they
+//! read the **current eval's issuer from a thread-local** ([`CURRENT_EVAL`]),
+//! which the worker sets before each run and clears after. The eval's
+//! [`Capability`](ikigai_core::Capability) is never on the worker at all: the
+//! issuer resolves every sub-request under the *minting invocation's*
+//! capability, so per-eval attenuation is preserved unchanged.
 
 use async_trait::async_trait;
-use crossbeam_channel::{Receiver, Sender};
-use futures::channel::{mpsc, oneshot};
-use futures::StreamExt;
 use ikigai_core::{
     ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Expiry, Invocation, Iri,
-    ReprType, Representation, Request, Result, Verb,
+    ReprType, Representation, Request, Result, SyncIssuer, Verb,
 };
 use ikigai_sexpr::Sexpr;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Mutex, OnceLock};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
@@ -307,79 +309,72 @@ impl Endpoint for LispEval {
 
 /// Run `src` on a warm worker under `inv`'s capability, with `input` reachable from the
 /// program via `(input)`. Shared by `urn:lisp:eval` and stored-program endpoints
-/// ([`LispProgram`]): a builtin sends a `VerbCall` and parks; we service each by issuing
-/// it, so every sub-request carries this invocation's capability and its golden threads
-/// fold into the result.
+/// ([`LispProgram`]): the eval runs inside the kernel's [`Invocation::scope_sync`], so
+/// every verb builtin's blocking `issuer.issue(…)` carries this invocation's capability
+/// and its golden threads fold into the result — core's guarantees, not this crate's.
 async fn run_eval(
     inv: &Invocation<'_>,
     src: String,
     input: Option<String>,
 ) -> Result<Representation> {
-    // `call_tx` is the only sender for this eval — the worker drops it when the run
-    // finishes, which is how the servicing loop learns the eval is done. These two
-    // are ASYNC on the receiving side (the worker still sends synchronously): the
-    // servicing loop must yield `Pending` — never block its executor thread — so
-    // a wall-clock `Timeout` overlay racing this eval can actually fire, and so a
-    // scheduler worker is parked, not pinned, while the program runs.
-    let (call_tx, mut call_rx) = mpsc::unbounded::<WorkerMsg>();
-    let (result_tx, result_rx) = oneshot::channel::<Result<String>>();
-
-    // Check out a warm worker (or spawn one, within the worker ceiling — at the
-    // ceiling this is a typed transient refusal, the wire-eval compute governor's
-    // thread bound). Sending cannot fail: a pooled worker is alive (its `job_rx`
-    // sender is held here), a fresh one too.
+    // Check out a warm worker FIRST, on the async side (or spawn one, within the
+    // worker ceiling — at the ceiling this is a typed transient refusal, the
+    // wire-eval compute governor's thread bound). It must happen before entering
+    // the sync scope: the refusal is synchronous and immediate, so a nested eval
+    // probing it with a no-parking poll sees `Unavailable`, never `Pending`.
     let worker = checkout_worker()?;
-    let sent = worker.send(EvalJob {
-        src,
-        input,
-        call_tx,
-        result_tx,
-    });
 
-    // The two cacheability inputs, observed here on the async side: whether any mutating
-    // verb ran, and the program's opt-in ceiling (if any). See [`decide_expiry`].
-    let mut mutated = false;
-    let mut author_expiry: Option<Expiry> = None;
-
-    if sent.is_ok() {
-        // `next` yields `None` once the worker drops the eval's `call_tx` — the loop's
-        // natural exit. Both message kinds arrive on this one channel, in program order.
-        while let Some(msg) = call_rx.next().await {
-            match msg {
-                WorkerMsg::Verb(call) => {
-                    // A Sink/Delete makes the eval a side effect — track it from the VERB
-                    // (before dispatch, so even a *denied* mutation still forbids caching).
-                    if call.verb.is_mutating() {
-                        mutated = true;
-                    }
-                    let result = dispatch(inv, &call).await;
-                    // The evaluator parked on this reply; a send failure only means it went
-                    // away first, which the next `recv` will observe.
-                    let _ = call.reply.send(result);
-                }
-                WorkerMsg::Cache(hint) => {
-                    // An opt-in `(cacheable …)` ran. Resolve its expiry (a ttl needs the
-                    // kernel's clock) and fold it into any earlier opt-in, most-restrictive.
-                    let e = hint.resolve(inv);
-                    author_expiry = Some(author_expiry.map_or(e, |prev| prev.most_restrictive(e)));
-                }
+    // The sync scope's closure runs on core's scope thread; the Steel engine cannot
+    // run THERE (the warm template is pinned to its pooled worker thread — `Engine`
+    // is `!Send`), so the closure forwards the job — with the scope's [`SyncIssuer`]
+    // — to the warm worker and blocks for the outcome. While the program runs, the
+    // scope future yields (never blocks its executor thread), so a wall-clock
+    // `Timeout` overlay racing this eval can actually fire, and a scheduler worker
+    // is parked, not pinned. When the scope future is dropped mid-run (a fired
+    // governor), the worker's next `issuer.issue` fails cleanly — the catchable
+    // error that unwinds the program.
+    let (worker, outcome) = inv
+        .scope_sync(move |issuer| {
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<EvalOutcome>(1);
+            // A send failure means the pooled worker's thread already exited —
+            // surface it exactly like a mid-run death (below), and let it go.
+            if worker
+                .send(EvalJob {
+                    src,
+                    input,
+                    issuer,
+                    result_tx,
+                })
+                .is_err()
+            {
+                return (None, EvalOutcome::worker_died());
             }
-        }
+            // A live worker sends exactly one outcome, then is safe to reuse. A worker
+            // that died mid-run drops `result_tx`, so the recv fails — surface it and
+            // do not re-pool.
+            match result_rx.recv() {
+                Ok(outcome) => (Some(worker), outcome),
+                Err(_) => (None, EvalOutcome::worker_died()),
+            }
+        })
+        .await?;
+
+    // Re-pool a worker that completed cleanly (even when the PROGRAM errored —
+    // that is a clean completion; only a dead worker is dropped).
+    if let Some(worker) = worker {
+        check_in_worker(worker);
     }
 
-    // A live worker sends exactly one result, then is safe to reuse. A worker that died
-    // mid-run (a Steel panic) drops `result_tx`, so the await cancels — surface it and
-    // let that worker go (do not re-pool).
-    match result_rx.await {
-        Ok(text) => {
-            check_in_worker(worker);
-            let expiry = decide_expiry(mutated, author_expiry);
-            Ok(Representation::new(text_plain_utf8(), text?.into_bytes()).with_expiry(expiry))
-        }
-        Err(_) => Err(Error::Endpoint(
-            "lisp: evaluator thread panicked".to_string(),
-        )),
-    }
+    let text = outcome.result?;
+    // Resolve the program's cache opt-ins here, where the kernel's clock is
+    // reachable, folding multiple opt-ins most-restrictive (in program order).
+    let author_expiry = outcome
+        .hints
+        .into_iter()
+        .map(|hint| hint.resolve(inv))
+        .reduce(Expiry::most_restrictive);
+    let expiry = decide_expiry(outcome.mutated, author_expiry);
+    Ok(Representation::new(text_plain_utf8(), text.into_bytes()).with_expiry(expiry))
 }
 
 /// A stored Lisp program bound as an endpoint — **the program IS the endpoint**. Sourcing
@@ -590,18 +585,6 @@ impl Endpoint for SignedRun {
     }
 }
 
-/// A message from the synchronous Steel side to the async servicing loop, over the
-/// eval's one channel. A [`Verb`](WorkerMsg::Verb) is a kernel sub-request the
-/// builtin parks on; a [`Cache`](WorkerMsg::Cache) is a fire-and-forget opt-in
-/// signal from a `(cacheable …)` form (no reply). One channel keeps every
-/// cacheability decision input on the `invoke` side, observed in program order.
-enum WorkerMsg {
-    /// A kernel verb sub-request (the builtin awaits the reply).
-    Verb(VerbCall),
-    /// The program opted this eval into caching (no reply expected).
-    Cache(CacheHint),
-}
-
 /// A program's caching opt-in, raised by a `(cacheable …)` builtin. Resolved to an
 /// [`Expiry`] on the async side, where the kernel's clock is reachable.
 enum CacheHint {
@@ -641,58 +624,65 @@ fn decide_expiry(mutated: bool, author_expiry: Option<Expiry>) -> Expiry {
     }
 }
 
-/// One verb invocation the Steel side asks the kernel to perform, with a reply
-/// channel the builtin parks on. `args` are the named kernel arguments, in program
-/// order — `[("in", …)]` for a Source input, `[("content", …)]` for a Sink body,
-/// `[("as", …)]` for a Meta representation request, `[("query", …)]` for a compiled
-/// `(sparql-select …)`, or whatever name/value pairs an `(invoke …)` carries. A
-/// single general shape, so any endpoint's arguments are reachable from Lisp.
-struct VerbCall {
-    verb: Verb,
-    iri: String,
-    args: Vec<(String, String)>,
-    reply: Sender<std::result::Result<String, String>>,
+/// What one eval produced, sent back by the worker: the rendered result plus the
+/// two cacheability inputs observed DURING the run — whether any mutating verb was
+/// issued (even a denied one), and the program's `(cacheable …)` opt-ins in program
+/// order. [`run_eval`] resolves the hints against the invocation (a ttl needs the
+/// kernel's clock) and decides the expiry; see [`decide_expiry`].
+struct EvalOutcome {
+    result: Result<String>,
+    mutated: bool,
+    hints: Vec<CacheHint>,
 }
 
-/// Service one `VerbCall` by issuing it through the kernel under this invocation's
-/// capability, returning the representation's text or a message. A kernel error
-/// (including a typed `Denied`) becomes the `Err` string the builtin re-raises as a
-/// catchable Steel error.
-async fn dispatch(inv: &Invocation<'_>, call: &VerbCall) -> std::result::Result<String, String> {
-    let iri =
-        Iri::parse(&call.iri).map_err(|e| format!("lisp: invalid IRI `{}`: {e}", call.iri))?;
-    let mut request = Request::new(call.verb, iri);
-    for (name, value) in &call.args {
-        request = request.with_arg(name.as_str(), ArgRef::Inline(value.clone().into_bytes()));
-    }
-    match inv.issue(request).await {
-        Ok(repr) => String::from_utf8(repr.bytes)
-            .map_err(|_| format!("lisp: `{}` returned non-UTF-8 bytes", call.iri)),
-        Err(e) => Err(format!("{e}")),
+impl EvalOutcome {
+    /// The outcome standing in for a worker that died instead of answering (its
+    /// `result_tx` dropped mid-run, or its thread was already gone). The safe
+    /// cacheability posture: `mutated` false + no hints ⇒ `Always` (uncacheable),
+    /// and the error propagates first anyway.
+    fn worker_died() -> Self {
+        EvalOutcome {
+            result: Err(Error::Endpoint(
+                "lisp: evaluator thread panicked".to_string(),
+            )),
+            mutated: false,
+            hints: Vec::new(),
+        }
     }
 }
 
-/// One unit of work for a warm worker: source to evaluate, the eval's servicing
-/// channel (which the worker installs as [`CURRENT_TX`] for the run), and a
-/// one-shot channel to return the rendered result (or a lisp/eval error).
+/// One unit of work for a warm worker: source to evaluate, the sync scope's
+/// [`SyncIssuer`] (which the worker installs as [`CURRENT_EVAL`] for the run), and
+/// a rendezvous channel to return the [`EvalOutcome`].
 struct EvalJob {
     src: String,
     /// The value the program reads via `(input)` — data handed to the program (a
     /// reactor's tuple, a piped body), kept distinct from `src` so a stored program is
     /// never fed its input as code.
     input: Option<String>,
-    call_tx: mpsc::UnboundedSender<WorkerMsg>,
-    result_tx: oneshot::Sender<Result<String>>,
+    issuer: SyncIssuer,
+    result_tx: SyncSender<EvalOutcome>,
+}
+
+/// The per-eval state a worker holds while a program runs: the scope's issuer the
+/// verb builtins issue through, and the cacheability observations that return with
+/// the result. Lives in [`CURRENT_EVAL`] for the duration of one run.
+struct EvalCtx {
+    issuer: SyncIssuer,
+    /// Whether any mutating verb (Sink/Delete) was ISSUED — set from the verb before
+    /// dispatch, so even a denied mutation still forbids caching.
+    mutated: bool,
+    /// The program's `(cacheable …)` opt-ins, in program order.
+    hints: Vec<CacheHint>,
 }
 
 thread_local! {
-    /// The servicing channel of the eval currently running on THIS worker thread.
+    /// The per-eval state of the eval currently running on THIS worker thread.
     /// The worker sets it before each run and takes (drops) it after; the verb
     /// builtins read it at call time. A worker runs one eval at a time, so this is
     /// unambiguous — and it is what lets the builtins be registered once on a
-    /// shared warm template yet route to the right (per-eval) servicing loop.
-    static CURRENT_TX: RefCell<Option<mpsc::UnboundedSender<WorkerMsg>>> =
-        const { RefCell::new(None) };
+    /// shared warm template yet route to the right (per-eval) sync scope.
+    static CURRENT_EVAL: RefCell<Option<EvalCtx>> = const { RefCell::new(None) };
 }
 
 thread_local! {
@@ -770,7 +760,7 @@ fn checkout_worker() -> Result<Sender<EvalJob>> {
             Err(current) => live = current,
         }
     }
-    let (job_tx, job_rx) = crossbeam_channel::unbounded::<EvalJob>();
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<EvalJob>();
     std::thread::spawn(move || {
         // Release the ceiling slot when this worker thread exits for any reason
         // (all senders dropped, or an unwinding panic) — the guard's Drop runs
@@ -801,8 +791,14 @@ fn check_in_worker(worker: Sender<EvalJob>) {
 fn worker_loop(job_rx: Receiver<EvalJob>) {
     let template = build_template();
     while let Ok(job) = job_rx.recv() {
-        // Install this eval's servicing channel + `(input)` data for the builtins to reach.
-        CURRENT_TX.with(|slot| *slot.borrow_mut() = Some(job.call_tx));
+        // Install this eval's issuer + `(input)` data for the builtins to reach.
+        CURRENT_EVAL.with(|slot| {
+            *slot.borrow_mut() = Some(EvalCtx {
+                issuer: job.issuer,
+                mutated: false,
+                hints: Vec::new(),
+            })
+        });
         CURRENT_INPUT.with(|slot| *slot.borrow_mut() = job.input);
         let mut engine = template.clone();
         // CATCH the panic here, where its payload still exists. A Steel VM panic used to
@@ -832,11 +828,25 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
                 }))
             }
         };
-        // Drop the eval's `call_tx` so the async servicing loop exits, THEN hand
-        // back the result. (Dropping the clone here also releases its state.)
-        CURRENT_TX.with(|slot| *slot.borrow_mut() = None);
+        // Take back the per-eval state and DROP the issuer before handing back the
+        // outcome: the sync scope's drain ends when every issuer clone is gone, so
+        // releasing it here lets the scope close promptly once the outcome lands.
+        // (Dropping the engine clone here also releases its state.)
+        let ctx = CURRENT_EVAL
+            .with(|slot| slot.borrow_mut().take())
+            .expect("a running eval installed its context");
         CURRENT_INPUT.with(|slot| *slot.borrow_mut() = None);
-        let _ = job.result_tx.send(result);
+        let EvalCtx {
+            issuer,
+            mutated,
+            hints,
+        } = ctx;
+        drop(issuer);
+        let _ = job.result_tx.send(EvalOutcome {
+            result,
+            mutated,
+            hints,
+        });
     }
 }
 
@@ -883,9 +893,9 @@ fn render_value(value: &SteelVal) -> String {
 
 /// Register the fixed-arity verb primitives the Scheme [`PRELUDE`] wraps. Each
 /// closure is `Send + Sync + 'static` (it captures nothing), reads the current
-/// eval's servicing channel from [`CURRENT_TX`], sends a `VerbCall`, and parks on
-/// the reply — an `Err` reply becomes a catchable Steel error via Steel's `Result`
-/// conversion. Registered once on the template and reused by every clone.
+/// eval's [`SyncIssuer`] from [`CURRENT_EVAL`], and blocks on `issuer.issue` —
+/// an `Err` becomes a catchable Steel error via Steel's `Result` conversion.
+/// Registered once on the template and reused by every clone.
 fn register_primitives(engine: &mut Engine) {
     engine.register_fn("%source", |iri: String| call(Verb::Source, iri, Vec::new()));
     engine.register_fn("%source-in", |iri: String, input: String| {
@@ -966,45 +976,57 @@ fn register_primitives(engine: &mut Engine) {
     });
 }
 
-/// Raise a caching opt-in for the current eval: send a [`CacheHint`] over its
-/// servicing channel. Fire-and-forget — the servicing loop folds it into the
-/// result's expiry; there is no reply to park on. A missing/closed channel is
-/// ignored (the loop has already decided). Returns `true` so the Scheme wrapper has
-/// a value to discard.
+/// Raise a caching opt-in for the current eval: record a [`CacheHint`] in its
+/// per-eval state, to return with the outcome. Fire-and-forget — [`run_eval`]
+/// folds it into the result's expiry; there is nothing to park on. A missing
+/// context is ignored (no eval is running). Returns `true` so the Scheme wrapper
+/// has a value to discard.
 fn cache_hint(hint: CacheHint) -> bool {
-    if let Some(tx) = CURRENT_TX.with(|slot| slot.borrow().clone()) {
-        let _ = tx.unbounded_send(WorkerMsg::Cache(hint));
-    }
+    CURRENT_EVAL.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            ctx.hints.push(hint);
+        }
+    });
     true
 }
 
-/// Send a `VerbCall` to the current eval's servicing loop and block until the
-/// reply — the synchronous face every Steel verb builtin calls. `args` are the
-/// named kernel arguments (already coerced to strings). The servicing channel is
-/// read from [`CURRENT_TX`], so a builtin registered once on the shared template
-/// reaches whichever eval is running on this worker.
+/// Issue one verb through the current eval's [`SyncIssuer`], blocking THIS worker
+/// thread until the representation (or error) comes back — the synchronous face
+/// every Steel verb builtin calls. `args` are the named kernel arguments (already
+/// coerced to strings). The issuer is read from [`CURRENT_EVAL`], so a builtin
+/// registered once on the shared template reaches whichever eval is running on
+/// this worker; the sub-request is resolved under the minting invocation's
+/// capability, and a kernel error (including a typed `Denied`) becomes the `Err`
+/// string the builtin re-raises as a catchable Steel error. When the sync scope
+/// was dropped mid-run (a fired Timeout governor), the issue fails cleanly — the
+/// catchable error that unwinds a timed-out program and releases its worker.
 fn call(
     verb: Verb,
     iri: String,
     args: Vec<(String, String)>,
 ) -> std::result::Result<String, String> {
-    let tx = CURRENT_TX
-        .with(|slot| slot.borrow().clone())
+    // Observe a mutating verb BEFORE anything can fail: even a denied — or
+    // malformed — mutation attempt forbids caching this eval.
+    let issuer = CURRENT_EVAL
+        .with(|slot| {
+            slot.borrow_mut().as_mut().map(|ctx| {
+                if verb.is_mutating() {
+                    ctx.mutated = true;
+                }
+                ctx.issuer.clone()
+            })
+        })
         .ok_or_else(|| "lisp: no active eval context".to_string())?;
-    let (reply, reply_rx) = crossbeam_channel::bounded(1);
-    // A send failure means the async side is GONE — the eval was dropped (e.g. a
-    // Timeout overlay elapsed). The catchable error unwinds the program, which is
-    // what lets a timed-out, verb-calling run release its worker back to the pool.
-    tx.unbounded_send(WorkerMsg::Verb(VerbCall {
-        verb,
-        iri,
-        args,
-        reply,
-    }))
-    .map_err(|_| "lisp: eval cancelled (kernel channel closed)".to_string())?;
-    reply_rx
-        .recv()
-        .map_err(|_| "lisp: kernel dropped the reply".to_string())?
+    let parsed = Iri::parse(&iri).map_err(|e| format!("lisp: invalid IRI `{iri}`: {e}"))?;
+    let mut request = Request::new(verb, parsed);
+    for (name, value) in args {
+        request = request.with_arg(name.as_str(), ArgRef::Inline(value.into_bytes()));
+    }
+    match issuer.issue(request) {
+        Ok(repr) => String::from_utf8(repr.bytes)
+            .map_err(|_| format!("lisp: `{iri}` returned non-UTF-8 bytes")),
+        Err(e) => Err(format!("{e}")),
+    }
 }
 
 /// Map a verb name (from `(invoke 'source …)`, lowercased by convention) to its

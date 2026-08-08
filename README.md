@@ -99,8 +99,8 @@ let space = ikigai_lisp::space(); // binds urn:lisp:eval
 // mount into your kernel alongside the other modules
 ```
 
-Native-only: the synchronous Steel engine is bridged to the async kernel over the
-worker pool, so there is no wasm face yet. Builtin-set filtering by capability
+Native-only: the synchronous Steel engine reaches the async kernel through core's
+`Invocation::scope_sync` bridge (real threads), so there is no wasm face yet. Builtin-set filtering by capability
 (binding only the verbs a capability authorizes) is a later slice.
 
 ## License
