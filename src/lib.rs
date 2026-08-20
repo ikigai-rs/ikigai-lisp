@@ -166,9 +166,11 @@ use ikigai_core::{
 };
 use ikigai_sexpr::Sexpr;
 use std::cell::RefCell;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, Once, OnceLock};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
@@ -814,15 +816,11 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_program(&mut engine, job.src)
         })) {
-            Ok(result) => result,
+            Ok(result) => result.map_err(explain_isolation),
             Err(payload) => {
                 let detail = panic_message(&payload);
                 Err(Error::Endpoint(if detail.contains("index out of bounds") {
-                    "lisp: unbound identifier — each evaluation is isolated, so a \
-                     definition from an earlier one is not in scope. Put the definitions and \
-                     the call in the SAME program (e.g. transclude a prelude with \
-                     `$a{urn:lisp:aliases}`)."
-                        .to_string()
+                    format!("lisp: unbound identifier — {ISOLATION_HINT}")
                 } else {
                     format!("lisp: evaluator panicked: {detail}")
                 }))
@@ -861,10 +859,138 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Where `steel-core` will look for its home, mirroring its own resolution
+/// order: an explicit `STEEL_HOME`, else `~/.steel` when that already exists,
+/// else the XDG data home. Returns `None` when there is nothing for us to
+/// create — either steel will use a directory that is already there, or we
+/// cannot work out where it would be.
+///
+/// Pure, so the order can be tested without mutating process environment
+/// (which is global state, and racy under a threaded test runner).
+fn steel_home_path(
+    steel_home: Option<OsString>,
+    dot_steel_exists: bool,
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = steel_home {
+        return Some(PathBuf::from(explicit));
+    }
+    if dot_steel_exists {
+        return None;
+    }
+    let data_home = xdg_data_home
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".local").join("share")))?;
+    Some(data_home.join("steel"))
+}
+
+/// Create steel's home directory before the first engine is built.
+///
+/// `steel-core` 0.8.2 creates it with `create_dir` rather than `create_dir_all`
+/// (`src/compiler/modules.rs`), so on any account whose `~/.local/share` has
+/// never been created — a fresh service user being the usual case — it fails
+/// with ENOENT, prints to stderr, and carries on holding a home path that does
+/// not exist. It degrades quietly rather than failing, which is why it can sit
+/// unnoticed in a daemon's log for weeks.
+///
+/// Deliberately best-effort: a read-only home is a legitimate deployment (a
+/// sandboxed unit with `ProtectHome=`), and steel copes there, so this must not
+/// turn a working host into a broken one.
+fn ensure_steel_home() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let home = std::env::var_os("HOME");
+        let dot_steel_exists = home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".steel").exists())
+            .unwrap_or(false);
+        if let Some(path) = steel_home_path(
+            std::env::var_os("STEEL_HOME"),
+            dot_steel_exists,
+            std::env::var_os("XDG_DATA_HOME"),
+            home,
+        ) {
+            let _ = std::fs::create_dir_all(path);
+        }
+    });
+}
+
+#[cfg(test)]
+mod steel_home {
+    use super::steel_home_path;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn os(value: &str) -> Option<OsString> {
+        Some(OsString::from(value))
+    }
+
+    #[test]
+    fn explicit_override_wins() {
+        assert_eq!(
+            steel_home_path(os("/opt/steel"), true, os("/xdg"), os("/home/x")),
+            Some(PathBuf::from("/opt/steel"))
+        );
+    }
+
+    #[test]
+    fn existing_dot_steel_needs_nothing_created() {
+        assert_eq!(steel_home_path(None, true, os("/xdg"), os("/home/x")), None);
+    }
+
+    #[test]
+    fn xdg_data_home_is_used_when_set() {
+        assert_eq!(
+            steel_home_path(None, false, os("/xdg"), os("/home/x")),
+            Some(PathBuf::from("/xdg/steel"))
+        );
+    }
+
+    /// The case that bit the edge host: no XDG_DATA_HOME, and `~/.local/share`
+    /// had never been created, so steel's `create_dir` failed with ENOENT.
+    #[test]
+    fn falls_back_to_the_xdg_default_under_home() {
+        assert_eq!(
+            steel_home_path(None, false, None, os("/home/ikigai")),
+            Some(PathBuf::from("/home/ikigai/.local/share/steel"))
+        );
+    }
+
+    #[test]
+    fn nothing_to_do_without_a_home() {
+        assert_eq!(steel_home_path(None, false, None, None), None);
+    }
+}
+
+/// Guidance for an identifier steel cannot resolve.
+///
+/// TWO different shapes reach a user for the SAME mistake. When the shared
+/// symbol interner has never seen the name, steel returns a clean
+/// `FreeIdentifier` error; when it HAS seen it (from an earlier eval) but this
+/// fresh clone has no slot for it, steel panics with an index out of bounds.
+/// Which one you get therefore depends on interner state left behind by
+/// unrelated evaluations — so the explanation cannot live in only one of them.
+const ISOLATION_HINT: &str = "if it was defined in an earlier evaluation: each evaluation \
+     is isolated, so a definition from an earlier one is not in scope. Put the definitions \
+     and the call in the SAME program (e.g. transclude a prelude with `$a{urn:lisp:aliases}`).";
+
+/// Attach [`ISOLATION_HINT`] to steel's own free-identifier error, so the
+/// guidance does not depend on which shape the interner happened to produce.
+fn explain_isolation(error: Error) -> Error {
+    match error {
+        Error::Endpoint(text) if text.contains("FreeIdentifier") => {
+            Error::Endpoint(format!("{text} — {ISOLATION_HINT}"))
+        }
+        other => other,
+    }
+}
+
 /// Build the warm template: a sandboxed engine (full stdlib, dylib loading
 /// blocked), the verb primitives registered, and the Scheme [`PRELUDE`] run once.
 /// The prelude's definitions live in the template and so survive into every clone.
 fn build_template() -> Engine {
+    ensure_steel_home();
     let mut engine = Engine::new_sandboxed();
     register_primitives(&mut engine);
     engine
@@ -1823,6 +1949,32 @@ mod tests {
         assert!(
             !text.contains("thread panicked"),
             "must not leak the panic wording: {text}"
+        );
+    }
+
+    /// The other half of the same mistake. When the shared interner has never
+    /// seen the symbol, steel returns a clean `FreeIdentifier` rather than
+    /// panicking — and the user needs the same explanation. Until both shapes
+    /// carried it, WHICH message you got depended on interner state left by
+    /// unrelated evaluations, which made the sibling test above fail or pass
+    /// according to the parallel runner's schedule.
+    #[test]
+    fn an_identifier_never_defined_also_explains_the_isolation() {
+        let kernel = Kernel::new(Arc::new(
+            EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), eval()),
+        ));
+        let err = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse("urn:lisp:eval").unwrap()).with_arg(
+                "content",
+                ArgRef::Inline(b"(quokka-never-defined 1)".to_vec()),
+            ),
+            &Capability::root(),
+        ))
+        .expect_err("not in scope");
+        let text = err.to_string();
+        assert!(
+            text.contains("each evaluation is isolated"),
+            "must explain the isolation, got: {text}"
         );
     }
 }
