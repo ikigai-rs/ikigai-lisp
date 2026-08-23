@@ -1190,7 +1190,7 @@ fn steelval_to_pairs(value: &SteelVal) -> std::result::Result<Vec<(String, Strin
         );
     }
     let mut pairs = Vec::with_capacity(flat.len() / 2);
-    for pair in flat.chunks_exact(2) {
+    for pair in flat.as_chunks::<2>().0 {
         pairs.push((coerce_arg(pair[0])?, coerce_arg(pair[1])?));
     }
     Ok(pairs)
