@@ -84,8 +84,10 @@
 //! ## The two capability layers
 //!
 //! 1. **`urn:cap:lisp`** gates "may run arbitrary Lisp at all." It is declared on
-//!    the eval action's `requires` and enforced at entry (an eval without it is
-//!    denied before a single form is read).
+//!    the eval action's `requires`, so the kernel enforces it *before dispatch*
+//!    (declared = enforced); the endpoint re-checks at entry as a second line, for
+//!    the paths with no kernel gate. Either way an eval without it is denied before
+//!    a single form is read.
 //! 2. **Per-verb enforcement.** Each verb sub-request is checked by the carried
 //!    capability through the ordinary kernel machinery — the target endpoint's own
 //!    ACL. Slice 1 enforces the capability *on every sub-request*; binding only the
@@ -176,7 +178,8 @@ use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
 
 /// The capability gating "may run arbitrary Lisp at all." Declared on the eval
-/// action's `requires` and enforced at entry.
+/// action's `requires`, so the kernel enforces it before dispatch; the endpoint
+/// re-checks at entry as a second line, for the paths where no kernel gate ran.
 pub const CAP_LISP: &str = "urn:cap:lisp";
 
 /// The one dialect available in slice 1. `dialect` leaves room for `elisp`/`cl`.
@@ -234,10 +237,11 @@ pub fn space() -> EndpointSpace {
 #[async_trait]
 impl Endpoint for LispEval {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
-        // Layer 1 — enforce `urn:cap:lisp` at entry. `requires` is descriptive
-        // (drives catalog projection); the kernel does not enforce it for bound
-        // endpoints, so — like `ikigai-fs`'s path-ACL — this endpoint enforces its
-        // declared authority itself. A typed `Denied` (permanent, never transient).
+        // Layer 1 — `urn:cap:lisp`. The kernel has already refused a caller without
+        // it, before dispatch and before any cache-serve (core 0.1.49 onward:
+        // declared = enforced is the kernel's baseline). This entry check is the
+        // second line, for the paths where no kernel gate ran — a detached
+        // invocation, a module shim. A typed `Denied` (permanent, never transient).
         if !inv.capability.allows(CAP_LISP) {
             return Err(Error::Denied(format!(
                 "urn:lisp:eval requires the {CAP_LISP} capability"

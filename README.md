@@ -17,7 +17,9 @@ source urn:lisp:eval '(map (lambda (w) (source "urn:fn:toUpper" w)) (list "a" "b
 Two layers, both required:
 
 1. **`urn:cap:lisp`** — gates "may run arbitrary Lisp at all," declared on the
-   eval action's `requires` and enforced at entry.
+   eval action's `requires`, so the kernel enforces it before dispatch (declared
+   = enforced). The endpoint re-checks it at entry as a second line, for the
+   paths where no kernel gate ran.
 2. **Per-verb enforcement** — every verb sub-request carries the eval's
    capability, so a `(sink …)` the capability doesn't authorize comes back as a
    typed `Denied`, surfaced to the program as a catchable Steel error
