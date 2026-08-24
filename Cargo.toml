@@ -35,7 +35,7 @@ steel-core = "0.8.2"
 futures = "0.3"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
 # genuine urn:sign:verify (module composition, not a stub).
-ikigai-sign = "0.1.0"
+ikigai-sign = "0.2.0"
 
 # The wall-clock Timeout overlay — proves the wire-eval L1 governor end to end:
 # the async servicing loop yields, so the racing timer actually fires mid-eval.
