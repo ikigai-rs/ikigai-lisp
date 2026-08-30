@@ -33,6 +33,35 @@ rebuilt per call. Warm evals are on the order of **~0.2 ms** (vs. ~90 ms for a c
 `Engine::new()`), and every eval stays **isolated**: a `(define …)` in one eval
 can't leak into the next.
 
+### Strings are UTF-8 — never index-scan one
+
+Steel strings are Rust `String`s, so a *character* index costs a walk from the
+start: `string-ref` is O(i) and `string-length` is O(n). The ordinary
+`for i in 0..len` scan is therefore **quadratic**, and `(substring s i n)` inside a
+loop is quadratic *and* allocating. Nothing about that code looks slow, which is
+exactly the problem — one pass over a string of n characters, measured in release:
+
+| n       | `string->list` then walk | `string-ref` per index | `string-length` in the loop test | `substring` per step |
+|---------|--------------------------|------------------------|----------------------------------|----------------------|
+| 25 000  | 3.5 ms                   | 15 ms                  | 25 ms                            | 0.28 s               |
+| 50 000  | 7.2 ms                   | 51 ms                  | 98 ms                            | 1.04 s               |
+| 100 000 | 11 ms                    | 151 ms                 | 321 ms                           | 4.11 s               |
+
+Convert once with `string->list` and walk the chars; hoist `string-length` out of
+any loop that tests it; and bound untrusted text with `utf8-length` (bytes, O(1))
+*before* scanning it.
+
+### `read` carries nothing between calls
+
+Steel 0.8.2's `read` keeps one reader in a shared object and, on a string or file
+port whose text does not close, returns eof while **leaving the partial form in
+it** — so every later `read` on that worker appends its port to the stale fragment
+and reports `(eof)` for the life of the process. This crate shadows `read` for
+string and file ports with one whose reader is keyed to the port it drained: a
+port not already drained gets a fresh reader, successive reads of one port still
+walk its datums in order, and input that ends inside a form raises a catchable
+error naming the cause instead of quietly reading as eof.
+
 ## Opt-in caching
 
 An eval is uncacheable by default (it may `sink`/mutate). A program can opt in:
