@@ -160,6 +160,48 @@
 //! [`Capability`](ikigai_core::Capability) is never on the worker at all: the
 //! issuer resolves every sub-request under the *minting invocation's*
 //! capability, so per-eval attenuation is preserved unchanged.
+//!
+//! ### The one piece of state a clone does NOT isolate: `read`
+//!
+//! Isolation is by value, and Steel 0.8.2's `read` keeps its state in a *shared
+//! heap object* rather than a global slot: one reader, held by
+//! `scheme/modules/reader.scm`, that every clone of a worker's template points at.
+//! On a string or file port whose text does not close, that `read` returns the
+//! port's eof object and leaves the partial form in the reader — so the fragment
+//! outlives the eval that produced it, and every later `read` on that worker
+//! appends its port to the stale text and reports `(eof)`. One malformed input
+//! silently turns every request queued behind it into a parse failure; in a
+//! serial reactor the damage arrives long after its cause.
+//!
+//! [`PRELUDE_READ`] shadows it for string and file ports with a `read` whose
+//! reader is *keyed to the port it drained*: a port not already drained gets a
+//! fresh reader, so no fragment can cross a call, while successive reads of one
+//! port still walk its datums in order. Input that ends inside a form raises a
+//! catchable error naming the cause instead of returning eof. Any other port
+//! (stdin) still reaches the builtin. See `tests/read_carryover.rs`.
+//!
+//! ## Strings are UTF-8: never index-scan one
+//!
+//! Steel strings are Rust `String`s, so a *character* index costs a walk from the
+//! start. `string-ref` is `chars().nth(i)` and `string-length` is `chars().count()`
+//! — both O(n) — which makes the ordinary `for i in 0..len` scan **quadratic**, and
+//! `(substring s i n)` inside a loop quadratic *and* allocating. Nothing about the
+//! code looks slow, which is why this is worth stating rather than leaving to be
+//! rediscovered: it was, by a public form field reaching a serial reactor.
+//!
+//! Measured here (release, Apple silicon), one pass over a string of `n` chars:
+//!
+//! | n       | `string->list` then walk | `string-ref` per index | `string-length` in the loop test | `substring` per step |
+//! |---------|--------------------------|------------------------|----------------------------------|----------------------|
+//! | 25 000  | 3.5 ms                   | 15 ms                  | 25 ms                            | 0.28 s               |
+//! | 50 000  | 7.2 ms                   | 51 ms                  | 98 ms                            | 1.04 s               |
+//! | 100 000 | 11 ms                    | 151 ms                 | 321 ms                           | 4.11 s               |
+//!
+//! Doubling the input quadruples every column but the first. The rule that follows:
+//! **convert once with `string->list` and walk the chars**, hoist `string-length`
+//! out of any loop that tests it, and bound the size of untrusted text *before*
+//! scanning it — `utf8-length` is the O(1) one (bytes, not chars), so it is the
+//! check a hostile input should meet first.
 
 use async_trait::async_trait;
 use ikigai_core::{
@@ -215,6 +257,68 @@ const PRELUDE: &str = r#"
 (define (invoke verb iri . pairs) (%verb-args (symbol->string verb) iri pairs))
 (define (graph g) (%graph g))
 (define (input) (%input))
+"#;
+
+/// Captured BEFORE [`PRELUDE_READ`] shadows `read`, in its own `run` — Steel hoists a
+/// module body's `define`s, so `(define %steel-read read)` and `(define (read …) …)` in
+/// one body make the alias a forward reference to the redefinition, not to the builtin.
+const PRELUDE_READ_ALIAS: &str = r#"(define %steel-read read)"#;
+
+/// A `read` that cannot carry one call's leftovers into the next.
+///
+/// Steel 0.8.2's `read` keeps a SINGLE reader in a module-level global
+/// (`scheme/modules/reader.scm`) and, on a string or file port, returns the port's
+/// eof object when the accumulated text does not close — WITHOUT clearing that
+/// reader. The partial form then sits in the global forever: every later `read` on
+/// the same worker appends its port to the stale fragment and reports `(eof)`. One
+/// malformed input silently converts every request queued behind it into a parse
+/// failure, and the damage arrives long after its cause. (Reproduced in
+/// `tests/read_carryover.rs`; the reader survives the clone-per-eval isolation
+/// because it is a shared heap object, so it outlives the eval that poisoned it.)
+///
+/// This shadows it for the two port kinds ikigai actually reads — string and file —
+/// with one whose reader is keyed to the port it drained. A port we have not already
+/// drained gets a FRESH reader, so no fragment can cross a call; successive reads of
+/// one port still walk its datums in order. An input that ends inside a form raises a
+/// catchable error naming the cause, rather than returning eof and staying broken.
+/// Anything else (stdin) still goes to the builtin, unchanged.
+const PRELUDE_READ: &str = r#"
+(require-builtin #%private/steel/reader as %reader.)
+(define %read-port #f)
+(define %read-state (%reader.new-reader))
+
+(define (read . rest)
+  (let ((port (if (null? rest) (current-input-port) (car rest))))
+    (if (or (#%string-input-port? port) (#%file-input-port? port))
+        (%read-one-datum port)
+        (%steel-read port))))
+
+(define (%read-one-datum port)
+  (if (if (eq? port %read-port) #t (%read-drain port))
+      (let ((datum (%reader.reader-read-one %read-state)))
+        (cond
+          ((not (void? datum)) (%reader.#%intern datum))
+          ((%read-tail-is-blank?) (eof-object))
+          (else (error "read: input ends inside a form (unclosed paren or string)"))))
+      (eof-object)))
+
+;; Drain `port` into a reader of its own. Returns #f for a port holding nothing to
+;; read, so a blank input is eof rather than a diagnosis about an unclosed form.
+(define (%read-drain port)
+  (set! %read-port port)
+  (set! %read-state (%reader.new-reader))
+  (let ((text (trim (read-port-to-string port))))
+    (if (equal? text "")
+        #f
+        (begin (%reader.reader-push-string %read-state text) #t))))
+
+;; Void means the reader could not finish a datum, and two causes look identical from
+;; there: the input ran out cleanly (only a comment left) or it ended mid-form. Push a
+;; sentinel and read again — a comment contributes nothing, so a clean tail yields the
+;; sentinel itself, while an unterminated form swallows it and yields something else.
+(define (%read-tail-is-blank?)
+  (%reader.reader-push-string %read-state "\n()")
+  (equal? (%reader.reader-read-one %read-state) (list)))
 "#;
 
 /// The `urn:lisp:eval` endpoint: evaluate an s-expression whose builtins are the
@@ -997,9 +1101,11 @@ fn build_template() -> Engine {
     ensure_steel_home();
     let mut engine = Engine::new_sandboxed();
     register_primitives(&mut engine);
-    engine
-        .run(PRELUDE)
-        .expect("lisp: prelude is a constant and must compile");
+    for stage in [PRELUDE, PRELUDE_READ_ALIAS, PRELUDE_READ] {
+        engine
+            .run(stage)
+            .expect("lisp: prelude is a constant and must compile");
+    }
     engine
 }
 
