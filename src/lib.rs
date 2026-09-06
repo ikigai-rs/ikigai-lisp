@@ -1374,7 +1374,7 @@ mod tests {
         }
     }
 
-    /// A kernel that binds the real `ikigai-fn` module (for `urn:fn:toUpper`), the
+    /// A kernel that binds the real `ikigai-fn` module (for `urn:iki:fn:toUpper`), the
     /// Lisp eval endpoint, and the denying vault.
     fn kernel() -> Kernel {
         // A no-input constant resource, to exercise single-argument `(source iri)`.
@@ -1442,7 +1442,7 @@ mod tests {
         // `(source iri input)` issues a Source sub-request to a REAL sibling module
         // (ikigai-fn) — verb-as-function across a genuine module boundary.
         assert_eq!(
-            eval_ok(&lisp_cap(), r#"(source "urn:fn:toUpper" "hi")"#),
+            eval_ok(&lisp_cap(), r#"(source "urn:iki:fn:toUpper" "hi")"#),
             "HI"
         );
     }
@@ -1906,7 +1906,7 @@ mod tests {
         assert_eq!(
             eval_ok(
                 &lisp_cap(),
-                r#"(invoke 'source "urn:fn:toUpper" "in" "hi")"#
+                r#"(invoke 'source "urn:iki:fn:toUpper" "in" "hi")"#
             ),
             "HI"
         );
@@ -1916,7 +1916,10 @@ mod tests {
     fn invoke_accepts_symbol_argument_names() {
         // Names may be symbols (`'in`), coerced to their text — the lispy surface.
         assert_eq!(
-            eval_ok(&lisp_cap(), r#"(invoke 'source "urn:fn:toUpper" 'in "hi")"#),
+            eval_ok(
+                &lisp_cap(),
+                r#"(invoke 'source "urn:iki:fn:toUpper" 'in "hi")"#
+            ),
             "HI"
         );
     }
@@ -1946,7 +1949,7 @@ mod tests {
         assert_eq!(
             eval_ok(
                 &lisp_cap(),
-                r#"(with-handler (lambda (e) "caught") (invoke 'source "urn:fn:toUpper" "in"))"#,
+                r#"(with-handler (lambda (e) "caught") (invoke 'source "urn:iki:fn:toUpper" "in"))"#,
             ),
             "caught"
         );
@@ -1958,7 +1961,7 @@ mod tests {
         assert_eq!(
             eval_ok(
                 &lisp_cap(),
-                r#"(with-handler (lambda (e) "caught") (invoke 'frobnicate "urn:fn:toUpper" "in" "hi"))"#,
+                r#"(with-handler (lambda (e) "caught") (invoke 'frobnicate "urn:iki:fn:toUpper" "in" "hi"))"#,
             ),
             "caught"
         );
