@@ -127,7 +127,7 @@
 //!   `Expiry::At(now + secs)` via the kernel's injected clock; a clockless kernel
 //!   declines to cache it (falls back to `Always`), mirroring ikigai-core.
 //!
-//! The opt-in accumulates as a [`CacheHint`] in the worker's per-eval state and
+//! The opt-in accumulates as a `CacheHint` (private) in the worker's per-eval state and
 //! returns with the result, where the `invoke` side resolves it against the
 //! kernel's clock; a program with no `(cacheable …)` form leaves the default
 //! `Expiry::Always` untouched.
@@ -155,7 +155,7 @@
 //!
 //! Verb builtins are registered once on the template and reused by every clone,
 //! so they cannot capture a per-eval [`SyncIssuer`] clone directly. Instead they
-//! read the **current eval's issuer from a thread-local** ([`CURRENT_EVAL`]),
+//! read the **current eval's issuer from a thread-local** (`CURRENT_EVAL`, private),
 //! which the worker sets before each run and clears after. The eval's
 //! [`Capability`](ikigai_core::Capability) is never on the worker at all: the
 //! issuer resolves every sub-request under the *minting invocation's*
@@ -173,7 +173,7 @@
 //! silently turns every request queued behind it into a parse failure; in a
 //! serial reactor the damage arrives long after its cause.
 //!
-//! [`PRELUDE_READ`] shadows it for string and file ports with a `read` whose
+//! The private `PRELUDE_READ` shadows it for string and file ports with a `read` whose
 //! reader is *keyed to the port it drained*: a port not already drained gets a
 //! fresh reader, so no fragment can cross a call, while successive reads of one
 //! port still walk its datums in order. Input that ends inside a form raises a
