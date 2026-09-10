@@ -22,7 +22,21 @@
 //! at all* (the `urn:cap:lisp` grant this endpoint requires) also attenuates every
 //! verb the program can reach: a `(sink …)` the capability doesn't authorize comes
 //! back as a typed [`Denied`](ikigai_core::Error::Denied), surfaced to the program
-//! as a **catchable Steel error** (`with-handler`), never a panic.
+//! as a **catchable Steel error** (`with-handler`), never a panic — and one the
+//! program leaves uncaught leaves the eval as that same typed `Denied` (likewise a
+//! sub-request's transient `Unavailable`/`Timeout` stays transient), so a caller,
+//! a Retry overlay or an agent sees the resource's refusal, not an opaque
+//! endpoint string.
+//!
+//! ## Conformance
+//!
+//! `tests/conformance.rs` runs `ikigai-conformance` over a fixture kernel binding
+//! all three doors — [`eval`], a stored [`program`] and [`run_signed`] — beside the
+//! real `ikigai-sign` module the run door verifies through. No door is pure and
+//! none is declared cacheable: an eval is live until its program says otherwise
+//! (see *Cacheability* below), and the file pins that decision by hand, along with
+//! the two things the suite cannot see — a gate inside a sub-resolution, and the
+//! declared outputs against the served media types.
 //!
 //! ## Homoiconic SPARQL — `(sparql-select …)`
 //!
@@ -400,10 +414,17 @@ impl Endpoint for LispEval {
                     .class(XSD_STRING),
             )
             .input(
+                ArgSpec::new("content")
+                    .optional()
+                    .summary("the s-expression source — the piped-in alternative to `in`")
+                    .class(XSD_STRING),
+            )
+            .input(
                 ArgSpec::new("dialect")
                     .summary("the Lisp dialect; only `steel` is available in slice 1")
                     .one_of([DIALECT_STEEL])
-                    .default_value(DIALECT_STEEL),
+                    .default_value(DIALECT_STEEL)
+                    .class(XSD_STRING),
             )
             .input(
                 ArgSpec::new("data")
@@ -536,6 +557,12 @@ impl Endpoint for LispProgram {
                 ArgSpec::new("in")
                     .optional()
                     .summary("the data the program reads via `(input)` (piped/positional)")
+                    .class(XSD_STRING),
+            )
+            .input(
+                ArgSpec::new("content")
+                    .optional()
+                    .summary("the `(input)` data — the piped-in alternative to `in`")
                     .class(XSD_STRING),
             )
             .output(TEXT_PLAIN_UTF8)
@@ -691,6 +718,12 @@ impl Endpoint for SignedRun {
                     .summary("unsigned data the program reads via `(input)` (or piped)")
                     .class(XSD_STRING),
             )
+            .input(
+                ArgSpec::new("content")
+                    .optional()
+                    .summary("the unsigned `(input)` data — the piped-in alternative to `data`")
+                    .class(XSD_STRING),
+            )
             .output(TEXT_PLAIN_UTF8)
     }
 }
@@ -784,6 +817,10 @@ struct EvalCtx {
     mutated: bool,
     /// The program's `(cacheable …)` opt-ins, in program order.
     hints: Vec<CacheHint>,
+    /// Every kernel error a verb sub-request returned, in program order — kept
+    /// TYPED, so an error the program leaves uncaught can be re-surfaced as itself
+    /// rather than as the text Steel carried it in ([`retype_uncaught`]).
+    failures: Vec<Error>,
 }
 
 thread_local! {
@@ -907,6 +944,7 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
                 issuer: job.issuer,
                 mutated: false,
                 hints: Vec::new(),
+                failures: Vec::new(),
             })
         });
         CURRENT_INPUT.with(|slot| *slot.borrow_mut() = job.input);
@@ -946,14 +984,41 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
             issuer,
             mutated,
             hints,
+            failures,
         } = ctx;
         drop(issuer);
+        let result = retype_uncaught(result, &failures);
         let _ = job.result_tx.send(EvalOutcome {
             result,
             mutated,
             hints,
         });
     }
+}
+
+/// Re-surface an uncaught kernel error AS ITSELF.
+///
+/// A verb builtin hands the program a kernel error as text (a Steel error value
+/// is a string), so one the program does not catch leaves `engine.run` as
+/// `Endpoint("lisp: Error: Generic: \"<text>\"")` — and a typed `Denied` from a
+/// cap-gated resource the program reached, or a transient `Unavailable` from a
+/// saturated dependency, would reach the caller as an opaque endpoint failure:
+/// permanent-looking, nothing a Retry overlay or an agent can act on without
+/// sniffing the message. Instead every kernel error a sub-request returned is
+/// recorded typed, in program order, and when the uncaught error carries one of
+/// them verbatim (Steel quotes the message, so both spellings are tried), that
+/// typed error is the eval's result. An error the program caught and recovered
+/// from is not in the final text, so it stays caught; a program's own `(error …)`
+/// matches nothing and stays an `Endpoint` error.
+fn retype_uncaught(result: Result<String>, failures: &[Error]) -> Result<String> {
+    let Err(Error::Endpoint(text)) = result else {
+        return result;
+    };
+    let typed = failures.iter().rev().find(|failure| {
+        let shown = failure.to_string();
+        text.contains(&shown) || text.contains(&format!("{shown:?}"))
+    });
+    Err(typed.cloned().unwrap_or(Error::Endpoint(text)))
 }
 
 /// The human-readable half of a panic payload, which is a `&str` or a `String`.
@@ -1261,7 +1326,17 @@ fn call(
     match issuer.issue(request) {
         Ok(repr) => String::from_utf8(repr.bytes)
             .map_err(|_| format!("lisp: `{iri}` returned non-UTF-8 bytes")),
-        Err(e) => Err(format!("{e}")),
+        Err(e) => {
+            // The program sees the text (catchable); the worker keeps the type, so
+            // an uncaught one leaves the eval as itself — see `retype_uncaught`.
+            let text = e.to_string();
+            CURRENT_EVAL.with(|slot| {
+                if let Some(ctx) = slot.borrow_mut().as_mut() {
+                    ctx.failures.push(e);
+                }
+            });
+            Err(text)
+        }
     }
 }
 
