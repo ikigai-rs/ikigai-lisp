@@ -23,7 +23,10 @@ Two layers, both required:
 2. **Per-verb enforcement** — every verb sub-request carries the eval's
    capability, so a `(sink …)` the capability doesn't authorize comes back as a
    typed `Denied`, surfaced to the program as a catchable Steel error
-   (`with-handler`) — never a panic.
+   (`with-handler`) — never a panic. Left uncaught, it leaves the eval as that
+   same typed `Denied` (and a sub-request's `Unavailable`/`Timeout` stays
+   transient), so a caller, a Retry overlay or an agent sees the resource's
+   refusal rather than an opaque endpoint string.
 
 ## Performance
 
@@ -133,6 +136,23 @@ let space = ikigai_lisp::space(); // binds urn:lisp:eval
 Native-only: the synchronous Steel engine reaches the async kernel through core's
 `Invocation::scope_sync` bridge (real threads), so there is no wasm face yet. Builtin-set filtering by capability
 (binding only the verbs a capability authorizes) is a later slice.
+
+## Conformance
+
+Passes [`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance):
+`tests/conformance.rs` walks a fixture kernel binding `urn:lisp:eval`, a stored
+program and the signed-run door beside the real `ikigai-sign` module the door
+verifies through, with no opt-outs and every check running. Two decisions the
+suite cannot hold are pinned there by hand:
+
+- **An eval is live until its program says otherwise.** No door is pure and none
+  is declared cacheable — a program can call any kernel verb, so an eval's
+  cacheability is whatever its sub-resolutions carry, and one that touches
+  nothing is still served uncacheable until the program itself opts in with
+  `(cacheable …)`.
+- **A gate inside a sub-resolution propagates typed.** A program that reaches a
+  cap-gated resource under a capability that may run Lisp but holds no grant on
+  that resource comes out as that resource's own `Denied`, on all three doors.
 
 ## License
 

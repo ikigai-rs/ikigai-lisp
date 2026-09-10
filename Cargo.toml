@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-lisp"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -33,6 +33,10 @@ steel-core = "0.8.2"
 # Test executor (`block_on`, `now_or_never`) only — the sync↔async bridge itself
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
 futures = "0.3"
+# The module recipe as one test (`tests/conformance.rs`): walks every endpoint the
+# fixture kernel binds and reports every violation at once. Dev-only, and it pins
+# `ikigai-core ^0.1.67`, which unifies with this crate's caret on the 0.1 line.
+ikigai-conformance = "0.1.0"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
 # genuine urn:sign:verify (module composition, not a stub).
 ikigai-sign = "0.2.0"
