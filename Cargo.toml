@@ -36,7 +36,7 @@ futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`): walks every endpoint the
 # fixture kernel binds and reports every violation at once. Dev-only, and it pins
 # `ikigai-core ^0.1.67`, which unifies with this crate's caret on the 0.1 line.
-ikigai-conformance = "0.1.0"
+ikigai-conformance = "0.2.0"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
 # genuine urn:sign:verify (module composition, not a stub).
 ikigai-sign = "0.2.0"
