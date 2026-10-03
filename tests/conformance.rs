@@ -52,7 +52,7 @@ use futures::executor::block_on;
 use ikigai_conformance::{rdf, Check, Fixture, Report, Suite};
 use ikigai_core::{
     ArgRef, Capability, Description, Endpoint, Error, Exact, Expiry, Invocation, Iri, Kernel,
-    ReprType, Representation, Request, Result as CoreResult, Verb,
+    ReprType, Representation, Request, Result as CoreResult, Thread, Verb,
 };
 use ikigai_lisp::{CAP_LISP, CAP_LISP_RUN};
 
@@ -299,13 +299,20 @@ fn an_eval_is_live_until_its_program_says_otherwise() {
         "a live eval is never stored"
     );
 
-    // The program opts in: cached, with an empty thread set — the AUTHOR's promise
-    // that the form is a pure function, which is why this file cannot declare the
-    // endpoint `pure` (that would be true of this program, not of the endpoint).
+    // The program opts in: cached, and hung from no thread but eval's own name —
+    // the AUTHOR's promise that the form is a pure function, which is why this file
+    // cannot declare the endpoint `pure` (that would be true of this program, not of
+    // the endpoint). Since core 0.1.73 the kernel hangs every cacheable answer on its
+    // own canonical target's thread, so purity is "no FOREIGN thread", not "no
+    // thread" (ledger #549); the set is empty on an older core, which `all` admits.
     let opted = request(Verb::Source, EVAL_IRI, &[("in", "(cacheable (+ 40 2))")]);
     let repr = issue(&kernel, opted.clone(), &cap);
     assert_eq!(repr.expiry, Expiry::Never);
-    assert!(repr.threads().is_empty(), "a pure form carries no thread");
+    assert!(
+        repr.threads().iter().all(|t| *t == Thread::new(EVAL_IRI)),
+        "a pure form carries only its own thread: {:?}",
+        repr.threads()
+    );
     assert!(kernel.is_cached(&opted, &cap), "the opt-in is stored");
 
     // Over a threaded resource the opt-in inherits that resource's thread, and a
