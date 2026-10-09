@@ -441,6 +441,7 @@ impl Endpoint for LispEval {
         // declared = enforced is the kernel's baseline). This entry check is the
         // second line, for the paths where no kernel gate ran — a detached
         // invocation, a module shim. A typed `Denied` (permanent, never transient).
+        source_only(inv, "urn:lisp:eval")?;
         if !inv.capability.allows(CAP_LISP) {
             return Err(Error::Denied(format!(
                 "urn:lisp:eval requires the {CAP_LISP} capability"
@@ -462,7 +463,7 @@ impl Endpoint for LispEval {
         let src = read_source(inv)?.to_string();
         // `data=` hands the program a value it reads via `(input)`, kept distinct from
         // `src` — the seam a stored-program endpoint uses to pass a tuple as data, not code.
-        let input = inv.inline_str("data").ok().map(str::to_string);
+        let input = optional_str(inv, "data")?.map(|(_, data)| data.to_string());
         let args = Args {
             program: Some("in"),
             data: "data",
@@ -657,17 +658,19 @@ pub fn program(id: impl Into<String>, program: impl Into<String>) -> LispProgram
 #[async_trait]
 impl Endpoint for LispProgram {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        source_only(inv, &self.id)?;
         if !inv.capability.allows(CAP_LISP) {
             return Err(Error::Denied(format!(
                 "running a Lisp program requires the {CAP_LISP} capability"
             )));
         }
         // The piped tuple/body is the program's DATA (via `(input)`), never its source.
-        let input = read_source(inv).ok().map(str::to_string);
+        let input = first_str(inv, &["in", "content"])?;
         let args = Args {
             program: None,
-            data: "in",
+            data: input.map_or("in", |(name, _)| name),
         };
+        let input = input.map(|(_, data)| data.to_string());
         run_eval(inv, self.program.clone(), input, args).await
     }
 
@@ -705,10 +708,54 @@ impl Endpoint for LispProgram {
 /// The s-expression source: the `in` argument, falling back to a piped `content`
 /// (pipeline citizenship — a stage piped into `urn:lisp:eval` arrives as `content`).
 fn read_source<'a>(inv: &'a Invocation<'_>) -> Result<&'a str> {
-    match inv.inline_str("in") {
-        Ok(src) => Ok(src),
-        Err(_) => inv.inline_str("content"),
+    // `in` is the argument the description requires, so it is the one a missing program
+    // is named by (H-F3), even though the piped `content` would also have served.
+    first_str(inv, &["in", "content"])?
+        .map(|(_, src)| src)
+        .ok_or_else(|| Error::MissingArgument("in".to_string()))
+}
+
+/// An optional inline argument as UTF-8, with its name: `None` when it is absent, and
+/// an error when it is present but unusable — not UTF-8, or not inline. Data that
+/// cannot be decoded is refused, never quietly replaced by nothing (C-B10).
+fn optional_str<'a, 'n>(
+    inv: &'a Invocation<'_>,
+    name: &'n str,
+) -> Result<Option<(&'n str, &'a str)>> {
+    match inv.inline_str(name) {
+        Ok(value) => Ok(Some((name, value))),
+        Err(Error::MissingArgument(_)) => Ok(None),
+        Err(other) => Err(other),
     }
+}
+
+/// The first of `names` present, as [`optional_str`] reads it.
+fn first_str<'a>(
+    inv: &'a Invocation<'_>,
+    names: &[&'static str],
+) -> Result<Option<(&'static str, &'a str)>> {
+    for name in names {
+        if let Some(found) = optional_str(inv, name)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// Every door serves Source only (its description also declares Meta, which the kernel
+/// answers from the description without invoking it). An Exists, a Sink or a Delete
+/// used to RUN the program — an existence probe executing code, sinks and all (C-B9).
+fn source_only(inv: &Invocation<'_>, door: &str) -> Result<()> {
+    if inv.request.verb == Verb::Source {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument {
+        name: "verb".to_string(),
+        detail: format!(
+            "`{door}` serves Source (its Meta is its description); {:?} would run the program",
+            inv.request.verb
+        ),
+    })
 }
 
 /// The capability to SUBMIT a signed program for execution. Distinct from
@@ -752,6 +799,7 @@ pub fn run_signed(trusted: impl IntoIterator<Item = impl Into<String>>) -> Signe
 #[async_trait]
 impl Endpoint for SignedRun {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        source_only(inv, "urn:lisp:run")?;
         if !inv.capability.allows(CAP_LISP_RUN) {
             return Err(Error::Denied(format!(
                 "submitting a signed program requires the {CAP_LISP_RUN} capability"
@@ -803,15 +851,12 @@ impl Endpoint for SignedRun {
         // sub-request; the worker ceiling (and any Timeout overlay fronting this
         // binding) bounds compute. Piped/`data=` input is reachable via
         // `(input)` — unsigned DATA, never evaluated.
-        let input = inv
-            .inline_str("data")
-            .or_else(|_| inv.inline_str("content"))
-            .ok()
-            .map(str::to_string);
+        let input = first_str(inv, &["data", "content"])?;
         let args = Args {
             program: Some("in"),
-            data: "data",
+            data: input.map_or("data", |(name, _)| name),
         };
+        let input = input.map(|(_, data)| data.to_string());
         run_eval(inv, program, input, args).await
     }
 
@@ -1655,7 +1700,17 @@ fn adapt(value: &SteelVal, depth: usize, max: usize) -> Result<Sexpr> {
         SteelVal::IntV(n) => Ok(Sexpr::Int(*n as i64)),
         // A float that happens to hold an integer value maps to `Int`; a fractional or
         // non-finite float has no home in the neutral datum and is an unsupported term.
-        SteelVal::NumV(n) if n.is_finite() && n.fract() == 0.0 => Ok(Sexpr::Int(*n as i64)),
+        // `as i64` saturates, so an integral float outside i64 is refused rather than
+        // rewritten to i64::MAX (C-R5). 2^63 is exactly representable; i64 stops below it.
+        SteelVal::NumV(n) if n.is_finite() && n.fract() == 0.0 => {
+            if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(n) {
+                Ok(Sexpr::Int(*n as i64))
+            } else {
+                Err(Error::Endpoint(format!(
+                    "the number {n} is outside the i64 range an s-expression integer holds"
+                )))
+            }
+        }
         other => Err(Error::Endpoint(format!(
             "sparql-select: unsupported term in query s-expr: {other}"
         ))),
