@@ -31,9 +31,8 @@ fn a_runaway_program_is_cut_off_at_the_wall_clock() {
     let cap = Capability::root();
 
     // A pure busy-loop: no verb calls, so nothing inside it ever fails — only
-    // the governor can end the CALLER's wait. (The worker thread itself keeps
-    // spinning — native Steel cannot be preempted; the worker-ceiling bounds how
-    // many such runaways can ever exist. Deterministic preemption is L2/wasm.)
+    // the governor can end the CALLER's wait. Dropping the caller's future then
+    // interrupts the program, so the worker is released too (`tests/interrupt.rs`).
     let started = Instant::now();
     let err = block_on(kernel.issue(eval("(let loop ((i 0)) (loop (+ i 1)))"), &cap)).unwrap_err();
     assert!(
@@ -50,7 +49,7 @@ fn a_runaway_program_is_cut_off_at_the_wall_clock() {
         "a timeout is transient (Retry/CB engage)"
     );
 
-    // The burned worker's slot is accounted; a fresh eval still runs (a new
+    // The interrupted worker's slot is accounted; a fresh eval still runs (a new
     // worker spawns under the ceiling). Recovery is asserted through an
     // un-overlaid kernel over the SAME global pool: a fresh worker builds its
     // Steel template on first use, which in a debug build can alone exceed the

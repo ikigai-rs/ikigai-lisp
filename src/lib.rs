@@ -199,6 +199,21 @@
 //! stdlib's part of them was derived, and the tests that pin them are in
 //! `src/sandbox.rs` and `docs/design/sandbox-allowlist.md` (audit round 6, ledger #903).
 //!
+//! ## Stopping a runaway
+//!
+//! The crate does not time evaluations itself: a host puts a wall-clock governor in
+//! front of the space (`ikigai-throttle`'s `Timeout`). When it fires, it drops the
+//! eval's future, and that drop INTERRUPTS the program: Steel checks for an interrupt
+//! before every instruction it dispatches, the flag stays set, and a `with-handler`
+//! handler is instructions too, so a program cannot catch its way past it. The
+//! worker is released, so a ceiling's worth of runaways no longer takes `urn:lisp:eval`
+//! and `urn:lisp:run` down (`tests/interrupt.rs`). Two things the interrupt does not
+//! reach: a native call that runs no instructions (one huge allocation; the bounds are
+//! for that), and a verb PARKED on a sub-request, where the governor fires when the
+//! endpoint serving that sub-request yields — promptly for one that awaits, only when
+//! it returns for one that blocks its thread. Govern a blocking dependency with its
+//! own overlay.
+//!
 //! ### `read` keeps a reader per port
 //!
 //! Steel 0.8.2's `read` keeps its state in ONE reader held by
@@ -251,10 +266,11 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
+use steel::steel_vm::ThreadStateController;
 
 mod sandbox;
 
@@ -481,15 +497,25 @@ async fn run_eval(
     // probing it with a no-parking poll sees `Unavailable`, never `Pending`.
     let worker = checkout_worker()?;
 
+    // If this future is dropped before the program finishes — a fired `Timeout`
+    // governor, a caller that gave up — the guard stops the program where it stands,
+    // so a runaway releases its worker instead of spinning on it forever (C-B3).
+    let job = Arc::new(Mutex::new(JobState::Pending));
+    let _stop_on_drop = StopOnDrop(Arc::clone(&job));
+
     // The sync scope's closure runs on core's scope thread; the Steel engine cannot
     // run THERE (an engine is pinned to the pooled worker thread that built it —
     // `Engine` is `!Send`), so the closure forwards the job — with the scope's
-    // [`SyncIssuer`] — to the worker and blocks for the outcome. While the program runs, the
-    // scope future yields (never blocks its executor thread), so a wall-clock
-    // `Timeout` overlay racing this eval can actually fire, and a scheduler worker
-    // is parked, not pinned. When the scope future is dropped mid-run (a fired
-    // governor), the worker's next `issuer.issue` fails cleanly — the catchable
-    // error that unwinds the program.
+    // [`SyncIssuer`] — to the worker and blocks for the outcome. While the program
+    // computes, the scope future is pending (it never blocks its executor thread), so a
+    // wall-clock `Timeout` overlay racing this eval can fire. While the program is
+    // PARKED on a verb, the scope future is serving that sub-request, and the overlay
+    // fires when the endpoint serving it next yields: promptly for an endpoint that
+    // awaits, but only when it RETURNS for one that blocks its thread (H-F4, measured
+    // at ~480 ms under a 100 ms budget against a 400 ms blocking dependency). Govern a
+    // blocking dependency with its own overlay. When the overlay fires, dropping this
+    // future interrupts the program (above) and fails the worker's pending
+    // `issuer.issue` — a program cannot catch its way past either.
     let (worker, outcome) = inv
         .scope_sync(move |issuer| {
             let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<EvalOutcome>(1);
@@ -501,6 +527,7 @@ async fn run_eval(
                     input,
                     issuer,
                     result_tx,
+                    job,
                 })
                 .is_err()
             {
@@ -831,6 +858,45 @@ struct EvalJob {
     input: Option<String>,
     issuer: SyncIssuer,
     result_tx: SyncSender<EvalOutcome>,
+    /// Shared with the caller's [`StopOnDrop`], so a caller that stops waiting can stop
+    /// the program.
+    job: Arc<Mutex<JobState>>,
+}
+
+/// Where one job stands, as both its caller and its worker see it.
+enum JobState {
+    /// Handed to a worker, not yet started.
+    Pending,
+    /// Running on an engine this controller can interrupt.
+    Running(ThreadStateController),
+    /// The caller stopped waiting before the program started: do not start it.
+    Cancelled,
+    /// The caller stopped waiting while the program ran: it was interrupted.
+    Stopped,
+    /// Finished (or never run); nothing left to stop.
+    Done,
+}
+
+/// Held by [`run_eval`]'s future. Dropped before the program finishes, it interrupts
+/// the program's engine: Steel checks for an interrupt before EVERY instruction it
+/// dispatches, and the flag stays set, so the error it raises cannot be caught — a
+/// `with-handler` handler is code too, and its first instruction raises again. What
+/// the interrupt cannot reach is a native call that runs no instructions (a huge
+/// allocation); that is what the bounds are for.
+struct StopOnDrop(Arc<Mutex<JobState>>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let mut state = lock(&self.0);
+        match &*state {
+            JobState::Pending => *state = JobState::Cancelled,
+            JobState::Running(controller) => {
+                controller.interrupt();
+                *state = JobState::Stopped;
+            }
+            JobState::Cancelled | JobState::Stopped | JobState::Done => {}
+        }
+    }
 }
 
 /// The per-eval state a worker holds while a program runs: the scope's issuer the
@@ -984,17 +1050,36 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
         });
         CURRENT_INPUT.with(|slot| *slot.borrow_mut() = job.input);
         let mut engine = next;
+        // Publish this engine's interrupt to the caller — unless the caller has already
+        // stopped waiting, in which case the program never starts.
+        let started = {
+            let mut state = lock(&job.job);
+            if matches!(*state, JobState::Cancelled) {
+                false
+            } else {
+                *state = JobState::Running(engine.get_thread_state_controller());
+                true
+            }
+        };
         // CATCH the panic here, where its payload still exists. A Steel VM panic used to
         // kill the worker and drop `result_tx`, so the caller learned only "evaluator
         // thread panicked" — true, useless, and identical for every cause.
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_program(&mut engine, job.src)
-        })) {
-            Ok(result) => result.map_err(explain_isolation),
-            Err(payload) => Err(Error::Endpoint(format!(
-                "lisp: evaluator panicked: {}",
-                panic_message(&payload)
-            ))),
+        let result = if !started {
+            Err(stopped())
+        } else {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_program(&mut engine, job.src)
+            })) {
+                Ok(result) => result.map_err(explain_isolation),
+                Err(payload) => Err(Error::Endpoint(format!(
+                    "lisp: evaluator panicked: {}",
+                    panic_message(&payload)
+                ))),
+            }
+        };
+        let result = match std::mem::replace(&mut *lock(&job.job), JobState::Done) {
+            JobState::Stopped => Err(stopped()),
+            _ => result,
         };
         // Take back the per-eval state and DROP the issuer before handing back the
         // outcome: the sync scope's drain ends when every issuer clone is gone, so
@@ -1021,6 +1106,18 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
         drop(engine);
         next = build_engine();
     }
+}
+
+/// Lock a job's state, through a poisoned lock: the state is a plain enum, whole after
+/// any panic.
+fn lock(job: &Mutex<JobState>) -> std::sync::MutexGuard<'_, JobState> {
+    job.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The outcome of a program its caller stopped waiting for. Nobody reads it (the caller
+/// is gone); it is typed so that it could not be mistaken for the program's answer.
+fn stopped() -> Error {
+    Error::Timeout("lisp: the evaluation was stopped: its caller stopped waiting".to_string())
 }
 
 /// Re-surface an uncaught kernel error AS ITSELF.
