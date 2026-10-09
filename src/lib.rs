@@ -214,6 +214,24 @@
 //! it returns for one that blocks its thread. Govern a blocking dependency with its
 //! own overlay.
 //!
+//! ## Bounds
+//!
+//! Steel's reader, expander and compiler recurse once per level of nesting, and a stack
+//! overflow aborts the host process rather than failing one eval. So nesting is bounded
+//! before Steel sees it — program text, data a program `read`s, and a value passed to
+//! `(graph …)` or `(sparql-select …)` — and each worker thread gets an explicit stack
+//! sized for the deepest input the bounds admit; program text and `(input)` data are
+//! bounded in size too. Each refusal is a typed error (`InvalidArgument` naming the
+//! argument at the door, a catchable error inside the program). A host sets the bounds,
+//! and the worker ceiling, with [`set_limits`] from its config home or flags; see
+//! [`Limits`] for each one, its default, and the measurement behind the stack size.
+//! No single call can ask for a huge allocation: the sandbox allows no function that
+//! takes a size (`make-vector`, `make-string`), and every allowed one allocates in
+//! proportion to what it is given (`tests/bounds.rs`). Growth ACROSS calls — a string
+//! doubled in a loop — passes an interrupt check between calls, so a governor bounds it
+//! in time; nothing bounds it in size, and a binding with no governor has no memory
+//! bound at all.
+//!
 //! ### `read` keeps a reader per port
 //!
 //! Steel 0.8.2's `read` keeps its state in ONE reader held by
@@ -272,7 +290,10 @@ use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
 use steel::steel_vm::ThreadStateController;
 
+mod limits;
 mod sandbox;
+
+pub use limits::{limits, set_limits, Limits};
 
 /// The capability gating "may run arbitrary Lisp at all." Declared on the eval
 /// action's `requires`, so the kernel enforces it before dispatch; the endpoint
@@ -361,6 +382,7 @@ const PRELUDE_READ: &str = r#"
   (set! %read-port port)
   (set! %read-state (%reader.new-reader))
   (let ((text (trim (read-port-to-string port))))
+    (%read-check text)
     (if (equal? text "")
         #f
         (begin (%reader.reader-push-string %read-state text) #t))))
@@ -424,7 +446,11 @@ impl Endpoint for LispEval {
         // `data=` hands the program a value it reads via `(input)`, kept distinct from
         // `src` — the seam a stored-program endpoint uses to pass a tuple as data, not code.
         let input = inv.inline_str("data").ok().map(str::to_string);
-        run_eval(inv, src, input).await
+        let args = Args {
+            program: Some("in"),
+            data: "data",
+        };
+        run_eval(inv, src, input, args).await
     }
 
     fn name(&self) -> &str {
@@ -489,7 +515,33 @@ async fn run_eval(
     inv: &Invocation<'_>,
     src: String,
     input: Option<String>,
+    args: Args,
 ) -> Result<Representation> {
+    // The bounds come first: an input out of bounds never reaches Steel, so it cannot
+    // overflow a worker's stack, and it never takes a worker at all.
+    if let Err(why) = limits::check_program(&src) {
+        return Err(match args.program {
+            Some(name) => Error::InvalidArgument {
+                name: name.to_string(),
+                detail: why,
+            },
+            None => Error::Endpoint(format!("lisp: the stored program is out of bounds: {why}")),
+        });
+    }
+    if let Some(data) = &input {
+        let max = limits().max_input_bytes;
+        if data.len() > max {
+            return Err(Error::InvalidArgument {
+                name: args.data.to_string(),
+                detail: format!(
+                    "the program's data is {} bytes; the bound is {max} (ikigai-lisp \
+                     Limits::max_input_bytes)",
+                    data.len()
+                ),
+            });
+        }
+    }
+
     // Check out a warm worker FIRST, on the async side (or spawn one, within the
     // worker ceiling — at the ceiling this is a typed transient refusal, the
     // wire-eval compute governor's thread bound). It must happen before entering
@@ -561,6 +613,13 @@ async fn run_eval(
     Ok(Representation::new(text_plain_utf8(), text.into_bytes()).with_expiry(expiry))
 }
 
+/// Which arguments carried a door's program and its data, for naming a bound's
+/// refusal. A stored program arrived with no argument: its refusal is the host's.
+struct Args {
+    program: Option<&'static str>,
+    data: &'static str,
+}
+
 /// A stored Lisp program bound as an endpoint — **the program IS the endpoint**. Sourcing
 /// it runs the FIXED program (set at bind time) with the invocation's piped input reachable
 /// via `(input)`, so a reactor — or any caller — hands it DATA, never code. This is the
@@ -588,7 +647,11 @@ impl Endpoint for LispProgram {
         }
         // The piped tuple/body is the program's DATA (via `(input)`), never its source.
         let input = read_source(inv).ok().map(str::to_string);
-        run_eval(inv, self.program.clone(), input).await
+        let args = Args {
+            program: None,
+            data: "in",
+        };
+        run_eval(inv, self.program.clone(), input, args).await
     }
 
     fn name(&self) -> &str {
@@ -728,7 +791,11 @@ impl Endpoint for SignedRun {
             .or_else(|_| inv.inline_str("content"))
             .ok()
             .map(str::to_string);
-        run_eval(inv, program, input).await
+        let args = Args {
+            program: Some("in"),
+            data: "data",
+        };
+        run_eval(inv, program, input, args).await
     }
 
     fn name(&self) -> &str {
@@ -945,25 +1012,13 @@ static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// Ceiling on concurrently-live eval workers (threads). Before this bound an
 /// unanswerable burst — or a runaway spawning nested evals — grew a thread per
 /// eval without limit (the resource-exhaustion finding from the 2026-07-21
-/// review, and a hard prerequisite for serving eval over the wire). Overridable
-/// via `IKIGAI_LISP_WORKERS` (min 1); the default is machine-fitness — the
-/// host's available parallelism, floored at 8 — so ordinary concurrency (a
-/// scheduler pool, a parallel test run) fits while a runaway still meets a
-/// bound instead of a thread per eval.
+/// review, and a hard prerequisite for serving eval over the wire). A host sets it
+/// with [`Limits::workers`] (it used to be an environment variable, #214); the
+/// default is machine-fitness — the host's available parallelism, floored at 8 — so
+/// ordinary concurrency (a scheduler pool, a parallel test run) fits while a runaway
+/// still meets a bound instead of a thread per eval.
 fn worker_ceiling() -> usize {
-    static CEILING: OnceLock<usize> = OnceLock::new();
-    *CEILING.get_or_init(|| {
-        std::env::var("IKIGAI_LISP_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|n| n.max(1))
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(8)
-                    .max(8)
-            })
-    })
+    limits().workers.max(1)
 }
 
 /// Take an idle worker, or spawn a fresh warm one **within the ceiling**. At the
@@ -986,7 +1041,7 @@ fn checkout_worker() -> Result<Sender<EvalJob>> {
         if live >= ceiling {
             return Err(Error::Unavailable(format!(
                 "lisp: all {ceiling} eval workers are busy (transient — retry, or raise \
-                 IKIGAI_LISP_WORKERS)"
+                 the host's ikigai-lisp Limits::workers)"
             )));
         }
         match LIVE_WORKERS.compare_exchange_weak(
@@ -1000,19 +1055,28 @@ fn checkout_worker() -> Result<Sender<EvalJob>> {
         }
     }
     let (job_tx, job_rx) = std::sync::mpsc::channel::<EvalJob>();
-    std::thread::spawn(move || {
-        // Release the ceiling slot when this worker thread exits for any reason
-        // (all senders dropped, or an unwinding panic) — the guard's Drop runs
-        // either way, so a dead worker never leaks its slot.
-        struct Slot;
-        impl Drop for Slot {
-            fn drop(&mut self) {
-                LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
-            }
+    // Release the ceiling slot when this worker thread exits for any reason (all
+    // senders dropped, or an unwinding panic) — the guard's Drop runs either way, so a
+    // dead worker never leaks its slot. Built here so a thread that fails to start
+    // releases it too.
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
         }
-        let _slot = Slot;
-        worker_loop(job_rx);
-    });
+    }
+    let slot = Slot;
+    // An explicit stack: Steel's front end recurses per level of nesting, and an
+    // overflow aborts the process, so the stack is sized for the deepest input the
+    // bounds admit (see `limits.rs`) rather than left at a spawned thread's 2 MiB.
+    std::thread::Builder::new()
+        .name("ikigai-lisp-eval".to_string())
+        .stack_size(limits().worker_stack_bytes)
+        .spawn(move || {
+            let _slot = slot;
+            worker_loop(job_rx);
+        })
+        .map_err(|e| Error::Unavailable(format!("lisp: an eval worker failed to start: {e}")))?;
     Ok(job_tx)
 }
 
@@ -1356,6 +1420,11 @@ fn register_primitives(engine: &mut Engine) {
     engine.register_fn("%delete", |iri: String| call(Verb::Delete, iri, Vec::new()));
     // `(input)` — the data handed to this eval (empty string if none). Reads the
     // per-job thread-local, so a stored program reaches its input without it being source.
+    // The prelude's `read` checks what it is about to parse: the reader recurses per
+    // level of nesting, and an overflow aborts the process (C-B6).
+    engine.register_fn("%read-check", |text: String| {
+        limits::check_nesting("the data being read", &text).map(|()| true)
+    });
     engine.register_fn("%input", || {
         CURRENT_INPUT.with(|slot| slot.borrow().clone().unwrap_or_default())
     });
@@ -1543,11 +1612,24 @@ fn coerce_arg(value: &SteelVal) -> std::result::Result<String, String> {
 /// surfaces as a catchable Steel error. This is the whole seam between Steel's value
 /// model and the language-agnostic compiler.
 fn steelval_to_sexpr(value: &SteelVal) -> Result<Sexpr> {
+    adapt(value, 0, limits().max_nesting)
+}
+
+/// [`steelval_to_sexpr`] at `depth`: a value nested past `max` is refused before the
+/// recursion — here, and in `ikigai-sexpr`'s compilers after it — can outrun the stack
+/// (C-B4; a program builds such a value in a loop, so no text bound sees it).
+fn adapt(value: &SteelVal, depth: usize, max: usize) -> Result<Sexpr> {
     match value {
         SteelVal::ListV(list) => {
+            if depth >= max {
+                return Err(Error::Endpoint(format!(
+                    "the value nests more than {max} levels deep (ikigai-lisp \
+                     Limits::max_nesting)"
+                )));
+            }
             let mut items = Vec::with_capacity(list.len());
             for v in list.iter() {
-                items.push(steelval_to_sexpr(v)?);
+                items.push(adapt(v, depth + 1, max)?);
             }
             Ok(Sexpr::List(items))
         }

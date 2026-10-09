@@ -20,9 +20,9 @@ use ikigai_core::{
 /// One eval at a time, every eval on the one worker.
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
-    // Safe: this binary is its own process, and every test takes this lock
-    // before its first eval initializes the ceiling.
-    std::env::set_var("IKIGAI_LISP_WORKERS", "1");
+    // This binary is its own process, and every test takes this lock before its
+    // first eval; the first call fixes the limits, the rest find them fixed.
+    let _ = ikigai_lisp::set_limits(ikigai_lisp::Limits::default().workers(1));
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 

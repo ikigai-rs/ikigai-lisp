@@ -33,9 +33,10 @@ fn eval(kernel: &Kernel, src: &str) -> String {
 /// pins anything while a single test owns the process.
 #[test]
 fn read_carries_nothing_between_calls() {
-    // Safe: this test binary is its own process, and this runs before any eval
-    // initializes the ceiling.
-    std::env::set_var("IKIGAI_LISP_WORKERS", "1");
+    // This test binary is its own process, and this runs before any eval fixes the
+    // limits.
+    ikigai_lisp::set_limits(ikigai_lisp::Limits::default().workers(1))
+        .expect("the first eval has not run");
     let kernel = Kernel::new(Arc::new(ikigai_lisp::space()));
 
     assert_eq!(
