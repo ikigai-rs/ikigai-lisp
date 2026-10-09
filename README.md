@@ -30,11 +30,23 @@ Two layers, both required:
 
 ## Performance
 
-Each eval runs on a fresh clone of a **warm, sandboxed Steel template** kept on a
-pool of worker threads — the full standard library is loaded once and reused, not
-rebuilt per call. Warm evals are on the order of **~0.2 ms** (vs. ~90 ms for a cold
-`Engine::new()`), and every eval stays **isolated**: a `(define …)` in one eval
-can't leak into the next.
+Every eval runs on a **sandboxed Steel engine built for it alone**, so nothing one
+evaluation defines — a global, a macro, a symbol's binding — is visible to another.
+(A per-eval clone of one warm engine shared the compiler between clones, so a
+`define-syntax` from one caller rewrote the next caller's program; ledger #903.)
+
+Each pooled worker builds its next engine right after answering, while it would
+otherwise be idle, so the build stays off the request path for ordinary traffic.
+Measured with `cargo run --release --example eval_cost` (Apple silicon):
+
+| traffic                       | warm clone (before) | engine per eval (now) |
+|-------------------------------|---------------------|-----------------------|
+| paced (a pause between evals) | 0.53 ms             | 0.37 ms               |
+| back-to-back on one worker    | 0.29 ms             | 63 ms                 |
+| first eval on a new worker    | 87 ms               | 77 ms                 |
+
+A worker kept continuously busy is bounded by the build: about 60 ms of CPU per
+eval. Concurrent callers spread across the pool, each worker building in parallel.
 
 ### Strings are UTF-8 — never index-scan one
 
