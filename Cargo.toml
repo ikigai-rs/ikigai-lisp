@@ -1,6 +1,14 @@
 [package]
 name = "ikigai-lisp"
-version = "0.1.15"
+# ★ 0.2.0 is THE SANDBOX RELEASE (audit round 6, ledger #903: 19 reproduced bugs, 13 serious). BREAKING:
+# a program reaches only a CONSTRUCTIVE ALLOWLIST (123 names + 8 macros, pinned by a test that the reachable set
+# EQUALS the list); `require` of any path, `require-builtin`, `defmacro`, `begin-for-syntax`, procedural
+# `define-syntax` and Steel's private names are refused before compile; stdio is unreachable; Exists/Sink/Delete
+# on the lisp doors are refused; non-UTF-8 input is an error. Isolation: one engine per eval (back-to-back evals
+# cost ~63 ms of build, accepted 2026-10-09). A timed-out runaway is interrupted. `Limits`/`set_limits` (stack,
+# program/input bytes, nesting) replace IKIGAI_LISP_WORKERS. Hosts must wrap the binding in a Timeout to stop a
+# runaway (ikigai-cli: ledger #920).
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
