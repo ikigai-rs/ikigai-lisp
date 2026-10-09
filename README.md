@@ -28,6 +28,41 @@ Two layers, both required:
    transient), so a caller, a Retry overlay or an agent sees the resource's
    refusal rather than an opaque endpoint string.
 
+Both layers rest on the sandbox below: the verbs are the ONLY way out.
+
+## The sandbox: an allowlist
+
+A program holding only `urn:cap:lisp` reaches the world through the kernel verbs and
+nothing else. Steel's own "sandboxed" engine leaves about 1,800 globals bound — the
+environment, argv, process and git modules, runtime `eval`, the host's stdio ports —
+and `require` loaded any file the service user could read (audit round 6, ledger
+#903). So this crate does not try to name what is dangerous. It builds the
+program-visible world from what programs NEED and refuses everything else:
+
+- **Names.** After each engine is built, every global not on the allowlist is rebound
+  to a refusal: the kernel verbs and this crate's prelude, the pure Steel functions the
+  known programs use (numbers, lists, strings, `read` on a string port), and what those
+  need internally — the last list DERIVED from the reference graph of Steel's compiled
+  stdlib, never by trying things against the host. A Steel upgrade that adds a global
+  adds a refused one.
+- **Macros.** Only `and`, `or`, `cond`, `let*`, `quasiquote` and `with-handler` (with
+  the `reset`/`shift` it expands into) stay in scope.
+- **Forms that leave the evaluation** are refused before compiling: `require` of any
+  path, `require-builtin`, and the three ways a program runs its own code at EXPANSION
+  time in the compiler's macro engine (`defmacro`, `begin-for-syntax`, a `define-syntax`
+  that is not `syntax-rules`); and Steel's private `#%…` names.
+- There is **no default input port**: `read` reads a string port it is handed, so the
+  host's stdin (an MCP stdio host's protocol) is out of reach, and so is its stdout.
+
+A refusal is a catchable error inside the program and a typed `Denied` when left
+uncaught. The pins: the names a program can reach after build EQUAL the allowlist (a
+test observes every global before and after lock-down), and the derived list equals
+the closure of the program list over THIS Steel's stdlib, so an upgrade that moves
+Steel's internals fails CI saying which way. Anything off the list is refused —
+`display`, `vector-ref`, `string-join`, `when`, `struct` — and adding a pure function or
+macro is a one-line change the pins then check. The lists, how they were derived and
+how to regenerate them: `src/sandbox.rs` and `docs/design/sandbox-allowlist.md`.
+
 ## Performance
 
 Every eval runs on a **sandboxed Steel engine built for it alone**, so nothing one
@@ -47,6 +82,52 @@ Measured with `cargo run --release --example eval_cost` (Apple silicon):
 
 A worker kept continuously busy is bounded by the build: about 60 ms of CPU per
 eval. Concurrent callers spread across the pool, each worker building in parallel.
+Re-measured after the sandbox landed (same machine, main against the branch): back to
+back 56.3 against 55.3 ms, paced 0.76–0.81 against 0.77 ms — locking an engine down
+costs about 0.5 ms of its build, off the request path, and the pre-compile screen about
+2 µs for `(+ 1 2)` (0.9 ms for the largest corpus program, 106 KB, whose own compile and
+run takes 27 ms).
+
+## Stopping a runaway
+
+The crate does not time evaluations itself: a host puts a wall-clock governor in front
+of the space (`ikigai-throttle`'s `Timeout`). When it fires it drops the eval's future,
+and that drop **interrupts the program**: Steel checks for an interrupt before every
+instruction it dispatches and the flag stays set, so a `with-handler` handler cannot
+catch its way past it. The worker is released, so a ceiling's worth of runaways no
+longer takes `urn:lisp:eval` and `urn:lisp:run` down. Two limits: a verb PARKED on a
+sub-request is released when the endpoint serving it yields — promptly for one that
+awaits, only when it returns for one that blocks its thread (govern a blocking
+dependency with its own overlay) — and nothing bounds memory in SIZE: no allowed
+function takes a size, but a string doubled in a loop grows until the governor stops
+it, and a binding with no governor has no bound at all.
+
+## Bounds, and how a host sets them
+
+Steel's reader, expander and compiler recurse once per level of nesting, and a stack
+overflow aborts the host process rather than failing one eval. So nesting is bounded
+before Steel sees it (program text, data a program `read`s, a value passed to
+`(graph …)`/`(sparql-select …)`), each worker gets an explicit stack sized for the
+deepest input the bounds admit, and program and data sizes are bounded too. Each
+refusal is a typed error: `InvalidArgument` naming the argument at the door, a
+catchable error inside the program.
+
+| bound                | default                    | what it bounds |
+|----------------------|----------------------------|----------------|
+| `workers`            | available parallelism, ≥ 8 | live eval worker threads; past it, a transient `Unavailable` |
+| `worker_stack_bytes` | 128 MiB (reserved)         | each worker's stack; the deepest admitted program needs 32 MiB with Steel unoptimized |
+| `max_program_bytes`  | 4 MiB                      | program text |
+| `max_input_bytes`    | 16 MiB                     | `(input)` data |
+| `max_nesting`        | 1,000                      | levels of nesting in program text, `read` data, and values crossing into the s-expression compilers |
+
+A host sets them once, before the first eval, from its **config home or its flags —
+never environment variables** (`IKIGAI_LISP_WORKERS` is gone, ledger #214):
+
+```rust,ignore
+ikigai_lisp::set_limits(
+    ikigai_lisp::Limits::default().workers(4).max_input_bytes(1 << 20),
+).expect("before the first eval");
+```
 
 ### Strings are UTF-8 — never index-scan one
 
@@ -66,16 +147,17 @@ Convert once with `string->list` and walk the chars; hoist `string-length` out o
 any loop that tests it; and bound untrusted text with `utf8-length` (bytes, O(1))
 *before* scanning it.
 
-### `read` carries nothing between calls
+### `read` keeps a reader per port
 
 Steel 0.8.2's `read` keeps one reader in a shared object and, on a string or file
 port whose text does not close, returns eof while **leaving the partial form in
-it** — so every later `read` on that worker appends its port to the stale fragment
-and reports `(eof)` for the life of the process. This crate shadows `read` for
-string and file ports with one whose reader is keyed to the port it drained: a
-port not already drained gets a fresh reader, successive reads of one port still
-walk its datums in order, and input that ends inside a form raises a catchable
-error naming the cause instead of quietly reading as eof.
+it** — so every later `read` appends its port to the stale fragment and reports
+`(eof)`. This crate replaces `read` with one that keeps a reader per port for the
+life of the evaluation: a port read for the first time gets a fresh reader, reads of
+one port walk its datums in order however reads of other ports interleave with them,
+and input that ends inside a form raises a catchable error naming the cause instead of
+quietly reading as eof. It reads a string port it is handed — `(read (open-input-string
+(input)))` — and nothing else.
 
 ## Opt-in caching
 
@@ -142,8 +224,30 @@ it, and verify it — all homoiconically.
 
 ```rust,ignore
 let space = ikigai_lisp::space(); // binds urn:lisp:eval
-// mount into your kernel alongside the other modules
+// mount into your kernel alongside the other modules, behind a Timeout overlay
 ```
+
+Set the bounds first if the defaults do not fit (above), and put a `Timeout` in front
+of every binding — the embedded one too: it is what stops a runaway.
+
+### Serving `urn:lisp:run`
+
+`ikigai_lisp::run_signed(keys)` runs a program a trusted key signed, under the
+submitter's capability, in the same sandbox and bounds. Three things a host serving it
+should know:
+
+- **A signed program replays.** The signature has no nonce, expiry or audience: anyone
+  holding `urn:cap:lisp:run` who has seen a signed program can run it again, on any host
+  trusting that key, for as long as the key is trusted. Sign programs that are safe to
+  run more than once, or retire the key.
+- **Its data is unsigned.** The submitter chooses the program's `(input)`; a program
+  that acts on its input must treat it as the submitter's, not the signer's.
+- **Trust is anchored on the key's IRI.** The key resolves through the kernel at verify
+  time, so whoever can write that resource can swap the key. Bind it from a resource
+  only the host controls.
+
+Every door serves Source (and Meta, from its description); an Exists, Sink or Delete is
+refused rather than running the program.
 
 Native-only: the synchronous Steel engine reaches the async kernel through core's
 `Invocation::scope_sync` bridge (real threads), so there is no wasm face yet. Builtin-set filtering by capability

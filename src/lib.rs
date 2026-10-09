@@ -2,7 +2,7 @@
 //! verbs, cap-scoped.
 //!
 //! A standalone **ikigai module crate** (like `ikigai-fn` / `ikigai-text`): a host
-//! links it in and mounts [`space`], rather than the engine shipping the behaviour
+//! links it in and mounts [`space`], rather than the engine shipping the behavior
 //! itself. It depends only on the published `ikigai-core` kernel.
 //!
 //! One endpoint, [`urn:lisp:eval`](eval), evaluates an s-expression with
@@ -127,7 +127,7 @@
 //! `sink`/mutate. A program opts THIS eval in with `(cacheable expr)` (permanently
 //! cacheable) or `(cacheable/ttl secs expr)` (cacheable for a max-age); both
 //! evaluate `expr` and return its value, marking the eval as their side effect.
-//! The opt-in is honoured only when it is *safe*:
+//! The opt-in is honored only when it is *safe*:
 //!
 //! - **Mutation wins.** If any `Sink` or `Delete` verb was issued during the run,
 //!   the result is forced uncacheable regardless of the opt-in — you cannot cache a
@@ -176,7 +176,8 @@
 //!
 //! So ordinary traffic sees no change, and a worker kept continuously busy is
 //! bounded by the build: about 60 ms of CPU per eval, ~15 evals per second per
-//! worker. Concurrent callers spread over the pool (up to the worker ceiling), each
+//! worker. (Re-measured after the sandbox: no measurable change; locking an engine
+//! down costs about 0.5 ms of its build.) Concurrent callers spread over the pool (up to the worker ceiling), each
 //! worker building in parallel.
 //!
 //! Steel's `Engine` is `!Send` (it holds `Rc`s), so an engine is pinned to the
@@ -488,7 +489,7 @@ impl Endpoint for LispEval {
                  `(sparql-select …)` and `(graph …)` compose SPARQL/Turtle homoiconically. \
                  Requires `urn:cap:lisp`; the result is the last form's value as text. \
                  Uncacheable by default; a program opts in with `(cacheable expr)` / \
-                 `(cacheable/ttl secs expr)`, honoured only when no verb mutated and never \
+                 `(cacheable/ttl secs expr)`, honored only when no verb mutated and never \
                  fresher than the eval's own inputs.",
             )
             .verb(Verb::Source)
@@ -782,6 +783,20 @@ pub const CAP_LISP_RUN: &str = "urn:cap:lisp:run";
 /// The signature covers the PROGRAM (`in`) only. Piped `content` (or `data=`) is
 /// the program's unsigned `(input)` DATA — data is data, never code: the same
 /// source/input separation [`LispProgram`] enforces.
+///
+/// What a host serving this door should know:
+///
+/// - **A signed program replays.** The signature carries no nonce, expiry or
+///   audience, so anyone holding `urn:cap:lisp:run` who has seen a signed program can
+///   run it again, here or on any host that trusts the same key, for as long as the key
+///   is trusted. Sign programs that are safe to run more than once, or retire the key.
+/// - **Its data is unsigned.** Whoever submits a signed program chooses its `(input)`.
+///   A program that acts on its input must treat it as the submitter's, not the
+///   signer's.
+/// - **Trust is anchored on the key's IRI.** The key is resolved through the kernel
+///   at verify time, so whoever can write that resource can swap the key. Bind it from
+///   a resource only the host controls.
+/// - It runs in the same sandbox, under the same bounds, as `urn:lisp:eval`.
 pub struct SignedRun {
     /// The key IRIs whose signatures this host accepts for code.
     trusted: Vec<String>,
@@ -924,7 +939,7 @@ impl CacheHint {
     /// The author's chosen expiry ceiling. A `Ttl` needs the kernel's injected
     /// clock to turn a max-age into an absolute deadline; a clockless kernel cannot
     /// evaluate a deadline, so it declines to cache (`Always`) rather than risk
-    /// serving forever — mirroring ikigai-core's clockless `At` behaviour.
+    /// serving forever — mirroring ikigai-core's clockless `At` behavior.
     fn resolve(&self, inv: &Invocation<'_>) -> Expiry {
         match self {
             CacheHint::Permanent => Expiry::Never,
@@ -999,7 +1014,7 @@ enum JobState {
     /// Running on an engine this controller can interrupt.
     Running(ThreadStateController),
     /// The caller stopped waiting before the program started: do not start it.
-    Cancelled,
+    Canceled,
     /// The caller stopped waiting while the program ran: it was interrupted.
     Stopped,
     /// Finished (or never run); nothing left to stop.
@@ -1018,12 +1033,12 @@ impl Drop for StopOnDrop {
     fn drop(&mut self) {
         let mut state = lock(&self.0);
         match &*state {
-            JobState::Pending => *state = JobState::Cancelled,
+            JobState::Pending => *state = JobState::Canceled,
             JobState::Running(controller) => {
                 controller.interrupt();
                 *state = JobState::Stopped;
             }
-            JobState::Cancelled | JobState::Stopped | JobState::Done => {}
+            JobState::Canceled | JobState::Stopped | JobState::Done => {}
         }
     }
 }
@@ -1180,7 +1195,7 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
         // stopped waiting, in which case the program never starts.
         let started = {
             let mut state = lock(&job.job);
-            if matches!(*state, JobState::Cancelled) {
+            if matches!(*state, JobState::Canceled) {
                 false
             } else {
                 *state = JobState::Running(engine.get_thread_state_controller());
@@ -1878,7 +1893,7 @@ mod tests {
         assert_eq!(String::from_utf8(rep.bytes).unwrap(), "42");
     }
 
-    // ---- supporting behaviour ---------------------------------------------
+    // ---- supporting behavior ---------------------------------------------
 
     #[test]
     fn an_uncaught_denial_surfaces_as_an_error_not_a_panic() {
