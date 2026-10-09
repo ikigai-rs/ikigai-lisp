@@ -146,53 +146,64 @@
 //! kernel's clock; a program with no `(cacheable …)` form leaves the default
 //! `Expiry::Always` untouched.
 //!
-//! ## Amortizing the engine (warm-clone pool)
+//! ## Isolation: one engine per evaluation
 //!
-//! Building a full Steel VM (`Engine::new_sandboxed`, stdlib + no-dylib posture)
-//! costs ~50 ms; a kernel verb call costs ~1 ms. So the VM is built **once per
-//! worker** and each eval runs on a cheap **clone of that warm template**
-//! (~0.2 ms). Steel's `Engine` is `!Send` (it holds `Rc`s), so a template is
-//! pinned to the thread that built it: the module keeps a small pool of
-//! **worker threads**, each owning one warm template, and checks one out per
-//! eval (spawning a fresh one only when all are busy — so nested and concurrent
-//! evals never block each other). A worker clones its template, runs the user
-//! program on the clone, and drops the clone; the template is never mutated.
+//! **Nothing one evaluation defines is visible to another** — not a global, not a
+//! macro, not a symbol's binding. `urn:lisp:eval` is stateless, and the callers of
+//! one worker are unrelated: two peers, two tenants, an unsigned eval and a
+//! verified signed program. So every evaluation runs on a Steel engine built for
+//! it alone and dropped after it (`tests/isolation.rs`).
 //!
-//! **Isolation** is the crux (`urn:lisp:eval` is stateless — two unrelated
-//! evals, e.g. future wire-eval from different peers, must not share globals). A
-//! clone deep-copies the global environment, so a `(define x 5)` lands only in
-//! that clone and vanishes when it is dropped — the next eval clones a pristine
-//! template. (Steel's `GlobalCheckpoint`/`rollback_to_checkpoint` was measured
-//! *faster* but does **not** isolate — a rolled-back binding is still readable —
-//! so clone-per-eval is used.) The `PRELUDE` runs once on the template, so its
-//! definitions survive into every clone while user state does not.
+//! This used to be a warm template cloned per eval (~0.2 ms), and that isolated
+//! VALUES only. Steel's `Engine::clone` shares the compiler between clones — its
+//! symbol table, macro scope, `defmacro` kernel and sources — so a `define-syntax`
+//! from one eval rewrote the next caller's program under the next caller's
+//! capability, a verified signed program included, and a name from an earlier eval
+//! read as `#<void>` once the later program grew the global table past its slot
+//! (audit round 6, ledger #903). Refusing `define-syntax`/`defmacro` would have kept
+//! the clone but not closed the stale-name half, and would have been a list of the
+//! forms someone thought of; a fresh compiler closes the class.
 //!
-//! Verb builtins are registered once on the template and reused by every clone,
-//! so they cannot capture a per-eval [`SyncIssuer`] clone directly. Instead they
-//! read the **current eval's issuer from a thread-local** (`CURRENT_EVAL`, private),
-//! which the worker sets before each run and clears after. The eval's
+//! The cost is one engine build per eval, and the worker pays it AHEAD: it builds
+//! the next engine right after answering, while it would otherwise sit idle. Measured
+//! with `examples/eval_cost.rs` (release, Apple silicon, `(+ 1 2)`):
+//!
+//! | traffic                         | warm clone (before) | engine per eval (now) |
+//! |---------------------------------|---------------------|-----------------------|
+//! | paced (a pause between evals)   | 0.53 ms             | 0.37 ms               |
+//! | back-to-back on one worker      | 0.29 ms             | 63 ms                 |
+//! | first eval on a new worker      | 87 ms               | 77 ms                 |
+//!
+//! So ordinary traffic sees no change, and a worker kept continuously busy is
+//! bounded by the build: about 60 ms of CPU per eval, ~15 evals per second per
+//! worker. Concurrent callers spread over the pool (up to the worker ceiling), each
+//! worker building in parallel.
+//!
+//! Steel's `Engine` is `!Send` (it holds `Rc`s), so an engine is pinned to the
+//! thread that built it: the module keeps a pool of **worker threads** and checks
+//! one out per eval, spawning a new one only when all are busy, so nested and
+//! concurrent evals never block each other. Verb builtins read the **current
+//! eval's issuer from a thread-local** (`CURRENT_EVAL`, private), which the worker
+//! sets before each run and clears after. The eval's
 //! [`Capability`](ikigai_core::Capability) is never on the worker at all: the
-//! issuer resolves every sub-request under the *minting invocation's*
-//! capability, so per-eval attenuation is preserved unchanged.
+//! issuer resolves every sub-request under the *minting invocation's* capability.
 //!
-//! ### The one piece of state a clone does NOT isolate: `read`
+//! ### `read` keeps a reader per port
 //!
-//! Isolation is by value, and Steel 0.8.2's `read` keeps its state in a *shared
-//! heap object* rather than a global slot: one reader, held by
-//! `scheme/modules/reader.scm`, that every clone of a worker's template points at.
-//! On a string or file port whose text does not close, that `read` returns the
-//! port's eof object and leaves the partial form in the reader — so the fragment
-//! outlives the eval that produced it, and every later `read` on that worker
-//! appends its port to the stale text and reports `(eof)`. One malformed input
-//! silently turns every request queued behind it into a parse failure; in a
-//! serial reactor the damage arrives long after its cause.
+//! Steel 0.8.2's `read` keeps its state in ONE reader held by
+//! `scheme/modules/reader.scm`. On a string or file port whose text does not close,
+//! it returns the port's eof object and leaves the partial form in that reader, so
+//! every later `read` appends its port to the stale text and reports `(eof)`. With
+//! an engine per eval that can no longer cross an evaluation, but it still crosses
+//! reads within one: a reactor draining several tuples per run lost every tuple
+//! after a malformed one.
 //!
-//! The private `PRELUDE_READ` shadows it for string and file ports with a `read` whose
-//! reader is *keyed to the port it drained*: a port not already drained gets a
-//! fresh reader, so no fragment can cross a call, while successive reads of one
-//! port still walk its datums in order. Input that ends inside a form raises a
-//! catchable error naming the cause instead of returning eof. Any other port
-//! (stdin) still reaches the builtin. See `tests/read_carryover.rs`.
+//! The private `PRELUDE_READ` shadows it for string and file ports with a `read`
+//! that keeps a reader per port: a port not seen before gets a fresh reader, so no
+//! fragment can cross ports, while successive reads of one port still walk its
+//! datums in order. Input that ends inside a form raises a catchable error naming
+//! the cause instead of returning eof. Any other port (stdin) still reaches the
+//! builtin. See `tests/read_carryover.rs`.
 //!
 //! ## Strings are UTF-8: never index-scan one
 //!
@@ -283,12 +294,10 @@ const PRELUDE_READ_ALIAS: &str = r#"(define %steel-read read)"#;
 /// Steel 0.8.2's `read` keeps a SINGLE reader in a module-level global
 /// (`scheme/modules/reader.scm`) and, on a string or file port, returns the port's
 /// eof object when the accumulated text does not close — WITHOUT clearing that
-/// reader. The partial form then sits in the global forever: every later `read` on
-/// the same worker appends its port to the stale fragment and reports `(eof)`. One
-/// malformed input silently converts every request queued behind it into a parse
-/// failure, and the damage arrives long after its cause. (Reproduced in
-/// `tests/read_carryover.rs`; the reader survives the clone-per-eval isolation
-/// because it is a shared heap object, so it outlives the eval that poisoned it.)
+/// reader. The partial form then sits in the global for the life of the engine:
+/// every later `read` appends its port to the stale fragment and reports `(eof)`.
+/// One malformed input silently converts every tuple read after it into a parse
+/// failure. (Reproduced in `tests/read_carryover.rs`.)
 ///
 /// This shadows it for the two port kinds ikigai actually reads — string and file —
 /// with one whose reader is keyed to the port it drained. A port we have not already
@@ -456,9 +465,9 @@ async fn run_eval(
     let worker = checkout_worker()?;
 
     // The sync scope's closure runs on core's scope thread; the Steel engine cannot
-    // run THERE (the warm template is pinned to its pooled worker thread — `Engine`
-    // is `!Send`), so the closure forwards the job — with the scope's [`SyncIssuer`]
-    // — to the warm worker and blocks for the outcome. While the program runs, the
+    // run THERE (an engine is pinned to the pooled worker thread that built it —
+    // `Engine` is `!Send`), so the closure forwards the job — with the scope's
+    // [`SyncIssuer`] — to the worker and blocks for the outcome. While the program runs, the
     // scope future yields (never blocks its executor thread), so a wall-clock
     // `Timeout` overlay racing this eval can actually fire, and a scheduler worker
     // is parked, not pinned. When the scope future is dropped mid-run (a fired
@@ -827,8 +836,8 @@ thread_local! {
     /// The per-eval state of the eval currently running on THIS worker thread.
     /// The worker sets it before each run and takes (drops) it after; the verb
     /// builtins read it at call time. A worker runs one eval at a time, so this is
-    /// unambiguous — and it is what lets the builtins be registered once on a
-    /// shared warm template yet route to the right (per-eval) sync scope.
+    /// unambiguous — and it is what lets the builtins, which capture nothing, route
+    /// to the right (per-eval) sync scope.
     static CURRENT_EVAL: RefCell<Option<EvalCtx>> = const { RefCell::new(None) };
 }
 
@@ -932,11 +941,20 @@ fn check_in_worker(worker: Sender<EvalJob>) {
     }
 }
 
-/// A warm worker: build the template engine ONCE, then serve each job on a fresh
-/// clone. The template is never mutated (only cloned), so every eval starts from
-/// the same pristine post-prelude state — this is what gives per-eval isolation.
+/// A worker: serve each job on an engine built for it alone, and build the next
+/// one after answering, while the worker is idle.
+///
+/// An engine is never reused. Steel's `Engine::clone` shares the COMPILER between
+/// the clones (its symbol table, its macro scope, its `defmacro` kernel and its
+/// sources), so a per-eval clone of a warm template isolated values but not
+/// definitions: a `define-syntax` from one eval rewrote the next caller's program,
+/// a verified signed program included, and a name from an earlier eval read as
+/// `#<void>` (audit round 6, ledger #903). A fresh engine has a fresh compiler, so
+/// nothing one evaluation defines can reach another. It costs one engine build per
+/// eval; building it AHEAD keeps that cost off the request path whenever the worker
+/// has a moment between jobs (see the module docs for the measurement).
 fn worker_loop(job_rx: Receiver<EvalJob>) {
-    let template = build_template();
+    let mut next = build_engine();
     while let Ok(job) = job_rx.recv() {
         // Install this eval's issuer + `(input)` data for the builtins to reach.
         CURRENT_EVAL.with(|slot| {
@@ -948,34 +966,22 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
             })
         });
         CURRENT_INPUT.with(|slot| *slot.borrow_mut() = job.input);
-        let mut engine = template.clone();
+        let mut engine = next;
         // CATCH the panic here, where its payload still exists. A Steel VM panic used to
         // kill the worker and drop `result_tx`, so the caller learned only "evaluator
         // thread panicked" — true, useless, and identical for every cause.
-        //
-        // The one that matters in practice: calling a function defined in an EARLIER eval.
-        // Isolation is by design (each eval clones a pristine template, so no value leaks
-        // between them) but Steel's symbol interner is shared across clones, so the fresh
-        // clone knows the symbol's id and has no slot for it — an index out of bounds where
-        // `unbound identifier` belongs. That is a confusing failure to meet in a REPL, so
-        // it is named.
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_program(&mut engine, job.src)
         })) {
             Ok(result) => result.map_err(explain_isolation),
-            Err(payload) => {
-                let detail = panic_message(&payload);
-                Err(Error::Endpoint(if detail.contains("index out of bounds") {
-                    format!("lisp: unbound identifier — {ISOLATION_HINT}")
-                } else {
-                    format!("lisp: evaluator panicked: {detail}")
-                }))
-            }
+            Err(payload) => Err(Error::Endpoint(format!(
+                "lisp: evaluator panicked: {}",
+                panic_message(&payload)
+            ))),
         };
         // Take back the per-eval state and DROP the issuer before handing back the
         // outcome: the sync scope's drain ends when every issuer clone is gone, so
         // releasing it here lets the scope close promptly once the outcome lands.
-        // (Dropping the engine clone here also releases its state.)
         let ctx = CURRENT_EVAL
             .with(|slot| slot.borrow_mut().take())
             .expect("a running eval installed its context");
@@ -993,6 +999,10 @@ fn worker_loop(job_rx: Receiver<EvalJob>) {
             mutated,
             hints,
         });
+        // The caller has its answer; retire this eval's engine and build the next
+        // one now, so the next job finds it ready.
+        drop(engine);
+        next = build_engine();
     }
 }
 
@@ -1136,33 +1146,29 @@ mod steel_home {
     }
 }
 
-/// Guidance for an identifier steel cannot resolve.
-///
-/// TWO different shapes reach a user for the SAME mistake. When the shared
-/// symbol interner has never seen the name, steel returns a clean
-/// `FreeIdentifier` error; when it HAS seen it (from an earlier eval) but this
-/// fresh clone has no slot for it, steel panics with an index out of bounds.
-/// Which one you get therefore depends on interner state left behind by
-/// unrelated evaluations — so the explanation cannot live in only one of them.
+/// Guidance for an identifier steel cannot resolve. The commonest cause in a REPL
+/// is a definition made in an EARLIER evaluation, which is not in scope by design.
 const ISOLATION_HINT: &str = "if it was defined in an earlier evaluation: each evaluation \
      is isolated, so a definition from an earlier one is not in scope. Put the definitions \
      and the call in the SAME program (e.g. transclude a prelude with `$a{urn:lisp:aliases}`).";
 
-/// Attach [`ISOLATION_HINT`] to steel's own free-identifier error, so the
-/// guidance does not depend on which shape the interner happened to produce.
+/// Attach [`ISOLATION_HINT`] to steel's free-identifier error, in both of the
+/// spellings it uses (a compile-time `FreeIdentifier`, a runtime `free identifier`).
 fn explain_isolation(error: Error) -> Error {
     match error {
-        Error::Endpoint(text) if text.contains("FreeIdentifier") => {
+        Error::Endpoint(text)
+            if text.contains("FreeIdentifier") || text.contains("free identifier") =>
+        {
             Error::Endpoint(format!("{text} — {ISOLATION_HINT}"))
         }
         other => other,
     }
 }
 
-/// Build the warm template: a sandboxed engine (full stdlib, dylib loading
-/// blocked), the verb primitives registered, and the Scheme [`PRELUDE`] run once.
-/// The prelude's definitions live in the template and so survive into every clone.
-fn build_template() -> Engine {
+/// Build one evaluation's engine: a sandboxed engine (full stdlib, dylib loading
+/// blocked), the verb primitives registered, and the Scheme [`PRELUDE`] run. Each
+/// engine serves exactly one evaluation (see [`worker_loop`]).
+fn build_engine() -> Engine {
     ensure_steel_home();
     let mut engine = Engine::new_sandboxed();
     register_primitives(&mut engine);
@@ -1174,7 +1180,7 @@ fn build_template() -> Engine {
     engine
 }
 
-/// Run `src` on `engine` (a fresh clone) and render its last value. Returns the
+/// Run `src` on `engine` (built for this eval alone) and render its last value. Returns the
 /// rendered text, or a lisp/eval error.
 fn run_program(engine: &mut Engine, src: String) -> Result<String> {
     let values = engine
@@ -1196,7 +1202,7 @@ fn render_value(value: &SteelVal) -> String {
 /// closure is `Send + Sync + 'static` (it captures nothing), reads the current
 /// eval's [`SyncIssuer`] from [`CURRENT_EVAL`], and blocks on `issuer.issue` —
 /// an `Err` becomes a catchable Steel error via Steel's `Result` conversion.
-/// Registered once on the template and reused by every clone.
+/// Registered on every engine as it is built.
 fn register_primitives(engine: &mut Engine) {
     engine.register_fn("%source", |iri: String| call(Verb::Source, iri, Vec::new()));
     engine.register_fn("%source-in", |iri: String, input: String| {
@@ -1295,8 +1301,7 @@ fn cache_hint(hint: CacheHint) -> bool {
 /// thread until the representation (or error) comes back — the synchronous face
 /// every Steel verb builtin calls. `args` are the named kernel arguments (already
 /// coerced to strings). The issuer is read from [`CURRENT_EVAL`], so a builtin
-/// registered once on the shared template reaches whichever eval is running on
-/// this worker; the sub-request is resolved under the minting invocation's
+/// reaches whichever eval is running on this worker; the sub-request is resolved under the minting invocation's
 /// capability, and a kernel error (including a typed `Denied`) becomes the `Err`
 /// string the builtin re-raises as a catchable Steel error. When the sync scope
 /// was dropped mid-run (a fired Timeout governor), the issue fails cleanly — the
@@ -1684,21 +1689,21 @@ mod tests {
 
     #[test]
     fn a_define_does_not_leak_into_the_next_eval() {
-        // The crux of the warm-clone pool: each eval runs on a fresh clone of the
-        // template, so a global defined in one eval is invisible to the next. If a
-        // single shared engine (or a leaky rollback) were used, eval 2 would see 5.
+        // The crux of the pool: each eval runs on an engine built for it alone, so a
+        // global defined in one eval is invisible to the next. If a single shared
+        // engine (or a leaky rollback) were used, eval 2 would see 5.
         let cap = lisp_cap();
         assert_eq!(eval_ok(&cap, "(define leaked 5) leaked"), "5");
         // A second eval that references `leaked` must NOT get 5.
         assert_unbound(&cap, "leaked", "5");
-        // And the prelude's verbs survive into every clone (not rolled away).
+        // And the prelude's verbs are on every engine.
         assert_eq!(eval_ok(&cap, r#"(source "urn:test:ping")"#), "pong");
     }
 
     #[test]
     fn stdlib_higher_order_functions_work() {
-        // The warm template is `new_sandboxed` (full stdlib), so `map`/`lambda`
-        // remain available — the amortization did not drop the prelude.
+        // Each engine is `new_sandboxed` (full stdlib), so `map`/`lambda` are
+        // available alongside the prelude.
         assert_eq!(
             eval_ok(&lisp_cap(), "(map (lambda (x) (* x x)) (list 1 2 3))"),
             "(1 4 9)"
@@ -2106,11 +2111,11 @@ mod tests {
     /// A Steel VM panic must reach the caller as an ERROR with a cause, not as
     /// "evaluator thread panicked".
     ///
-    /// The case that matters: calling a function defined in an EARLIER evaluation. Each
-    /// eval clones a pristine template — isolation by design, no values leak — but Steel's
-    /// symbol interner is shared across clones, so the fresh clone knows the symbol id and
-    /// has no slot for it. That surfaced as `index out of bounds`, which tells a REPL user
-    /// nothing about what they did.
+    /// The case that matters: calling a function defined in an EARLIER evaluation. When
+    /// evals were clones of one warm template, they shared a compiler that knew the
+    /// symbol while the fresh clone had no slot for it, which surfaced as `index out of
+    /// bounds` and told a REPL user nothing about what they did. An engine per eval
+    /// makes it a plain free identifier; the explanation must still be attached.
     #[test]
     fn a_definition_from_an_earlier_eval_reports_isolation_not_a_panic() {
         let kernel = Kernel::new(Arc::new(
@@ -2140,12 +2145,8 @@ mod tests {
         );
     }
 
-    /// The other half of the same mistake. When the shared interner has never
-    /// seen the symbol, steel returns a clean `FreeIdentifier` rather than
-    /// panicking — and the user needs the same explanation. Until both shapes
-    /// carried it, WHICH message you got depended on interner state left by
-    /// unrelated evaluations, which made the sibling test above fail or pass
-    /// according to the parallel runner's schedule.
+    /// The other half of the same mistake: a name no evaluation ever defined gets
+    /// the same explanation, so the guidance never depends on what ran before.
     #[test]
     fn an_identifier_never_defined_also_explains_the_isolation() {
         let kernel = Kernel::new(Arc::new(

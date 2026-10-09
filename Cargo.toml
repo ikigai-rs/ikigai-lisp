@@ -55,3 +55,10 @@ ikigai-fn = "0.2.0"
 # verb path, not a build link). `^0.1.5` unifies with lisp's ikigai-core (both 0.1.x),
 # so one kernel type is linked across the test.
 ikigai-sparql = "0.1.5"
+
+# Every evaluation builds its own Steel engine (isolation: see the module docs), and an
+# unoptimized Steel takes ~1 s to build one where an optimized one takes ~60 ms. Optimize
+# Steel alone in the dev/test profile so the test suite measures our code, not Steel's
+# debug build. A profile applies only to this workspace's own builds, never a consumer's.
+[profile.dev.package.steel-core]
+opt-level = 3
