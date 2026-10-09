@@ -244,7 +244,8 @@
 //!
 //! The private `PRELUDE_READ` replaces it with a `read` that keeps a reader per port:
 //! a port not seen before gets a fresh reader, so no fragment can cross ports, while
-//! successive reads of one port still walk its datums in order. Input that ends inside
+//! successive reads of one port still walk its datums in order, interleaved with reads
+//! of other ports or not. Input that ends inside
 //! a form raises a catchable error naming the cause instead of returning eof. It reads
 //! a string port it is handed and nothing else: the sandbox has no default input port
 //! (the host's stdin is not a program's) and cannot open a file, so `(read)` alone is a
@@ -345,11 +346,14 @@ const PRELUDE: &str = r#"
 /// One malformed input silently converts every tuple read after it into a parse
 /// failure. (Reproduced in `tests/read_carryover.rs`.)
 ///
-/// This replaces it with one whose reader is keyed to the port it drained. A port we
-/// have not already drained gets a FRESH reader, so no fragment can cross a call;
-/// successive reads of one port still walk its datums in order. An input that ends
-/// inside a form raises a catchable error naming the cause, rather than returning eof
-/// and staying broken.
+/// This replaces it with one that keeps a reader PER PORT, for the life of the
+/// evaluation. A port read for the first time is drained into a fresh reader of its
+/// own, so no fragment can cross ports; successive reads of one port walk its datums
+/// in order, however reads of other ports interleave with them. (The first version
+/// kept one port's reader at a time, so reading a second port in between lost the
+/// first port's remaining datums — H-F1, audit round 6, ledger #903.) An input that
+/// ends inside a form raises a catchable error naming the cause, rather than
+/// returning eof and staying broken.
 ///
 /// It reads STRING ports only, and only a port it is handed: the sandbox has no default
 /// input port (the host's stdin is not a program's to read — an MCP stdio host carries
@@ -357,8 +361,10 @@ const PRELUDE: &str = r#"
 /// catchable error that says what to do instead (see `src/sandbox.rs`).
 const PRELUDE_READ: &str = r#"
 (require-builtin #%private/steel/reader as %reader.)
-(define %read-port #f)
-(define %read-state (%reader.new-reader))
+
+;; One (port . reader) pair per port this evaluation has read, so interleaved reads of
+;; two ports each keep their place. A reader is #f for a port that held nothing.
+(define %readers '())
 
 (define (read . rest)
   (cond
@@ -368,32 +374,43 @@ const PRELUDE_READ: &str = r#"
     (else (error "read: only a string port can be read in the sandbox"))))
 
 (define (%read-one-datum port)
-  (if (if (eq? port %read-port) #t (%read-drain port))
-      (let ((datum (%reader.reader-read-one %read-state)))
-        (cond
-          ((not (void? datum)) (%reader.#%intern datum))
-          ((%read-tail-is-blank?) (eof-object))
-          (else (error "read: input ends inside a form (unclosed paren or string)"))))
-      (eof-object)))
+  (let ((state (%reader-for port %readers)))
+    (if state
+        (let ((datum (%reader.reader-read-one state)))
+          (cond
+            ((not (void? datum)) (%reader.#%intern datum))
+            ((%read-tail-is-blank? state) (eof-object))
+            (else (error "read: input ends inside a form (unclosed paren or string)"))))
+        (eof-object))))
 
-;; Drain `port` into a reader of its own. Returns #f for a port holding nothing to
-;; read, so a blank input is eof rather than a diagnosis about an unclosed form.
+;; The reader already holding `port`'s text, or a new one the first time it is read.
+(define (%reader-for port pairs)
+  (cond
+    ((null? pairs) (%read-drain port))
+    ((eq? (car (car pairs)) port) (cdr (car pairs)))
+    (else (%reader-for port (cdr pairs)))))
+
+;; Drain `port` into a reader of its own and remember it. #f for a port holding
+;; nothing to read, so a blank input is eof rather than a diagnosis about an unclosed
+;; form.
 (define (%read-drain port)
-  (set! %read-port port)
-  (set! %read-state (%reader.new-reader))
   (let ((text (trim (read-port-to-string port))))
     (%read-check text)
-    (if (equal? text "")
-        #f
-        (begin (%reader.reader-push-string %read-state text) #t))))
+    (let ((state (if (equal? text "")
+                     #f
+                     (let ((fresh (%reader.new-reader)))
+                       (%reader.reader-push-string fresh text)
+                       fresh))))
+      (set! %readers (cons (cons port state) %readers))
+      state)))
 
 ;; Void means the reader could not finish a datum, and two causes look identical from
 ;; there: the input ran out cleanly (only a comment left) or it ended mid-form. Push a
 ;; sentinel and read again — a comment contributes nothing, so a clean tail yields the
 ;; sentinel itself, while an unterminated form swallows it and yields something else.
-(define (%read-tail-is-blank?)
-  (%reader.reader-push-string %read-state "\n()")
-  (equal? (%reader.reader-read-one %read-state) (list)))
+(define (%read-tail-is-blank? state)
+  (%reader.reader-push-string state "\n()")
+  (equal? (%reader.reader-read-one state) (list)))
 "#;
 
 /// The prelude, in the order each engine runs it.
