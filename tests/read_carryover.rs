@@ -108,4 +108,28 @@ fn read_carries_nothing_between_calls() {
         ),
         "((a) (b) 3 #true)"
     );
+
+    // H-F1: interleaved reads of two ports keep BOTH ports' remaining datums. The
+    // reader used to be kept for ONE port at a time, so reading p2 between two reads
+    // of p1 replaced p1's reader, and p1's next read drained an already-empty port:
+    // `((a1) (x) (eof))` (audit round 6, ledger #903; the reproduction's input).
+    assert_eq!(
+        eval(
+            &kernel,
+            r#"(define p1 (open-input-string "(a1) (a2)"))
+               (define p2 (open-input-string "(x)"))
+               (list (read p1) (read p2) (read p1))"#,
+        ),
+        "((a1) (x) (a2))"
+    );
+    assert_eq!(
+        eval(
+            &kernel,
+            r#"(define p1 (open-input-string "1 2 3"))
+               (define p2 (open-input-string "a b"))
+               (list (read p1) (read p2) (read p1) (read p2) (read p1)
+                     (eof-object? (read p2)) (eof-object? (read p1)))"#,
+        ),
+        "(1 a 2 b 3 #true #true)"
+    );
 }

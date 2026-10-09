@@ -58,7 +58,7 @@ pub(crate) const PRELUDE_NAMES: &[&str] = &[
     "%source", "%source-in", "%sink", "%meta", "%meta-as", "%exists", "%delete", "%input",
     "%sparql-select", "%verb-args", "%graph", "%cache-permanent", "%cache-ttl",
     // `read`, kept per port (`PRELUDE_READ`), and the four reader primitives it uses.
-    "read", "%read-port", "%read-state", "%read-one-datum", "%read-drain",
+    "read", "%readers", "%reader-for", "%read-one-datum", "%read-drain",
     "%read-tail-is-blank?", "%read-check", "%reader.new-reader", "%reader.reader-push-string",
     "%reader.reader-read-one", "%reader.#%intern",
 ];
