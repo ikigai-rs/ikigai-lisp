@@ -17,9 +17,10 @@ use ikigai_core::{
 /// and not an unbounded second thread.
 #[test]
 fn at_the_ceiling_a_nested_eval_is_a_typed_transient_refusal() {
-    // Safe: this test binary is its own process and this runs before any eval
-    // initializes the ceiling.
-    std::env::set_var("IKIGAI_LISP_WORKERS", "1");
+    // This test binary is its own process, and this runs before any eval fixes the
+    // limits.
+    ikigai_lisp::set_limits(ikigai_lisp::Limits::default().workers(1))
+        .expect("the first eval has not run");
 
     // `urn:probe` — invoked from INSIDE the outer eval (so the outer worker is
     // checked out and busy) — attempts a second, nested eval and reports what
@@ -66,10 +67,7 @@ fn at_the_ceiling_a_nested_eval_is_a_typed_transient_refusal() {
         text.starts_with("refused-transient:"),
         "the nested eval at the ceiling must be a typed Unavailable, got: {text}"
     );
-    assert!(
-        text.contains("IKIGAI_LISP_WORKERS"),
-        "refusal names the knob"
-    );
+    assert!(text.contains("Limits::workers"), "refusal names the knob");
 
     // The refusal is transient, not a wedge: with the outer eval finished (its
     // worker back in the pool), the same eval now runs on the idle worker
