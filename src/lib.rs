@@ -188,6 +188,17 @@
 //! [`Capability`](ikigai_core::Capability) is never on the worker at all: the
 //! issuer resolves every sub-request under the *minting invocation's* capability.
 //!
+//! ## The sandbox: an allowlist, not Steel's whole stdlib
+//!
+//! A program holding only `urn:cap:lisp` reaches the world through the kernel verbs and
+//! nothing else. Each engine is locked down after its prelude runs: every global not on
+//! the allowlist is rebound to a refusal, only the macros programs use stay in scope, and
+//! `require`, `require-builtin`, `defmacro`, `begin-for-syntax` and a procedural
+//! `define-syntax` are refused before a program compiles. A refusal is a catchable error
+//! inside the program and a typed `Denied` when left uncaught. The lists, how the
+//! stdlib's part of them was derived, and the tests that pin them are in
+//! `src/sandbox.rs` and `docs/design/sandbox-allowlist.md` (audit round 6, ledger #903).
+//!
 //! ### `read` keeps a reader per port
 //!
 //! Steel 0.8.2's `read` keeps its state in ONE reader held by
@@ -198,12 +209,13 @@
 //! reads within one: a reactor draining several tuples per run lost every tuple
 //! after a malformed one.
 //!
-//! The private `PRELUDE_READ` shadows it for string and file ports with a `read`
-//! that keeps a reader per port: a port not seen before gets a fresh reader, so no
-//! fragment can cross ports, while successive reads of one port still walk its
-//! datums in order. Input that ends inside a form raises a catchable error naming
-//! the cause instead of returning eof. Any other port (stdin) still reaches the
-//! builtin. See `tests/read_carryover.rs`.
+//! The private `PRELUDE_READ` replaces it with a `read` that keeps a reader per port:
+//! a port not seen before gets a fresh reader, so no fragment can cross ports, while
+//! successive reads of one port still walk its datums in order. Input that ends inside
+//! a form raises a catchable error naming the cause instead of returning eof. It reads
+//! a string port it is handed and nothing else: the sandbox has no default input port
+//! (the host's stdin is not a program's) and cannot open a file, so `(read)` alone is a
+//! catchable error saying what to do instead. See `tests/read_carryover.rs`.
 //!
 //! ## Strings are UTF-8: never index-scan one
 //!
@@ -243,6 +255,8 @@ use std::sync::{Mutex, Once, OnceLock};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
+
+mod sandbox;
 
 /// The capability gating "may run arbitrary Lisp at all." Declared on the eval
 /// action's `requires`, so the kernel enforces it before dispatch; the endpoint
@@ -284,11 +298,6 @@ const PRELUDE: &str = r#"
 (define (input) (%input))
 "#;
 
-/// Captured BEFORE [`PRELUDE_READ`] shadows `read`, in its own `run` — Steel hoists a
-/// module body's `define`s, so `(define %steel-read read)` and `(define (read …) …)` in
-/// one body make the alias a forward reference to the redefinition, not to the builtin.
-const PRELUDE_READ_ALIAS: &str = r#"(define %steel-read read)"#;
-
 /// A `read` that cannot carry one call's leftovers into the next.
 ///
 /// Steel 0.8.2's `read` keeps a SINGLE reader in a module-level global
@@ -299,22 +308,27 @@ const PRELUDE_READ_ALIAS: &str = r#"(define %steel-read read)"#;
 /// One malformed input silently converts every tuple read after it into a parse
 /// failure. (Reproduced in `tests/read_carryover.rs`.)
 ///
-/// This shadows it for the two port kinds ikigai actually reads — string and file —
-/// with one whose reader is keyed to the port it drained. A port we have not already
-/// drained gets a FRESH reader, so no fragment can cross a call; successive reads of
-/// one port still walk its datums in order. An input that ends inside a form raises a
-/// catchable error naming the cause, rather than returning eof and staying broken.
-/// Anything else (stdin) still goes to the builtin, unchanged.
+/// This replaces it with one whose reader is keyed to the port it drained. A port we
+/// have not already drained gets a FRESH reader, so no fragment can cross a call;
+/// successive reads of one port still walk its datums in order. An input that ends
+/// inside a form raises a catchable error naming the cause, rather than returning eof
+/// and staying broken.
+///
+/// It reads STRING ports only, and only a port it is handed: the sandbox has no default
+/// input port (the host's stdin is not a program's to read — an MCP stdio host carries
+/// its protocol there) and no way to open a file, so `(read)` with no port is a
+/// catchable error that says what to do instead (see `src/sandbox.rs`).
 const PRELUDE_READ: &str = r#"
 (require-builtin #%private/steel/reader as %reader.)
 (define %read-port #f)
 (define %read-state (%reader.new-reader))
 
 (define (read . rest)
-  (let ((port (if (null? rest) (current-input-port) (car rest))))
-    (if (or (#%string-input-port? port) (#%file-input-port? port))
-        (%read-one-datum port)
-        (%steel-read port))))
+  (cond
+    ((null? rest)
+     (error "read: there is no default input port in the sandbox; read from a port, e.g. (read (open-input-string (input)))"))
+    ((#%string-input-port? (car rest)) (%read-one-datum (car rest)))
+    (else (error "read: only a string port can be read in the sandbox"))))
 
 (define (%read-one-datum port)
   (if (if (eq? port %read-port) #t (%read-drain port))
@@ -343,6 +357,9 @@ const PRELUDE_READ: &str = r#"
   (%reader.reader-push-string %read-state "\n()")
   (equal? (%reader.reader-read-one %read-state) (list)))
 "#;
+
+/// The prelude, in the order each engine runs it.
+const PRELUDE_STAGES: [&str; 2] = [PRELUDE, PRELUDE_READ];
 
 /// The `urn:lisp:eval` endpoint: evaluate an s-expression whose builtins are the
 /// cap-scoped kernel verbs. See the [module docs](crate).
@@ -1165,14 +1182,23 @@ fn explain_isolation(error: Error) -> Error {
     }
 }
 
-/// Build one evaluation's engine: a sandboxed engine (full stdlib, dylib loading
-/// blocked), the verb primitives registered, and the Scheme [`PRELUDE`] run. Each
-/// engine serves exactly one evaluation (see [`worker_loop`]).
+/// Build one evaluation's engine: Steel's sandboxed engine with the verb primitives
+/// registered and the Scheme [`PRELUDE`] run, then locked down to the allowlist
+/// (`src/sandbox.rs`). Each engine serves exactly one evaluation (see [`worker_loop`]).
 fn build_engine() -> Engine {
+    let mut engine = build_unlocked_engine();
+    sandbox::lock_down(&mut engine);
+    engine
+}
+
+/// [`build_engine`] before [`sandbox::lock_down`]: Steel's sandboxed engine with the
+/// primitives registered and the prelude run. Never handed a program; the sandbox's tests
+/// read its stdlib from here.
+fn build_unlocked_engine() -> Engine {
     ensure_steel_home();
     let mut engine = Engine::new_sandboxed();
     register_primitives(&mut engine);
-    for stage in [PRELUDE, PRELUDE_READ_ALIAS, PRELUDE_READ] {
+    for stage in PRELUDE_STAGES {
         engine
             .run(stage)
             .expect("lisp: prelude is a constant and must compile");
@@ -1183,9 +1209,17 @@ fn build_engine() -> Engine {
 /// Run `src` on `engine` (built for this eval alone) and render its last value. Returns the
 /// rendered text, or a lisp/eval error.
 fn run_program(engine: &mut Engine, src: String) -> Result<String> {
-    let values = engine
-        .run(src)
-        .map_err(|e| Error::Endpoint(format!("lisp: {e}")))?;
+    sandbox::screen(&src).map_err(|why| Error::Denied(format!("lisp: {why}")))?;
+    let values = engine.run(src).map_err(|e| {
+        let text = format!("lisp: {e}");
+        // A refused name the program called and did not catch is the sandbox saying no:
+        // a permanent, typed refusal, like the screen's.
+        if text.contains(sandbox::REFUSAL_MARK) {
+            Error::Denied(text)
+        } else {
+            Error::Endpoint(text)
+        }
+    })?;
     Ok(values.last().map(render_value).unwrap_or_default())
 }
 
@@ -1702,8 +1736,7 @@ mod tests {
 
     #[test]
     fn stdlib_higher_order_functions_work() {
-        // Each engine is `new_sandboxed` (full stdlib), so `map`/`lambda` are
-        // available alongside the prelude.
+        // `map` and `lambda` are on the sandbox's allowlist, beside the prelude.
         assert_eq!(
             eval_ok(&lisp_cap(), "(map (lambda (x) (* x x)) (list 1 2 3))"),
             "(1 4 9)"

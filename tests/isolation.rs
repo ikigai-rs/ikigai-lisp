@@ -182,22 +182,34 @@ fn an_unsigned_macro_does_not_rewrite_a_verified_signed_program() {
 
 /// The macro data leak: a macro's literal is a value one eval can plant and
 /// another can read. Every way of defining a macro is covered, so the guarantee
-/// is not a list of the forms someone thought of.
+/// is not a list of the forms someone thought of. (`defmacro` no longer gets as far
+/// as planting anything: the sandbox refuses it, because its body runs at expansion
+/// time in the compiler's macro engine. It stays here so the guarantee still covers it.)
 #[test]
 fn a_macro_defined_in_one_eval_is_not_visible_in_the_next() {
     let _serial = serial();
     let kernel = kernel();
-    for (plant, probe) in [
+    for (plant, probe, refused) in [
         (
             r#"(define-syntax leaked-rules (syntax-rules () ((_) "MACRO-SECRET"))) 0"#,
             "(leaked-rules)",
+            false,
         ),
         (
             r#"(defmacro (leaked-defmacro) "MACRO-SECRET") 0"#,
             "(leaked-defmacro)",
+            true,
         ),
     ] {
-        eval(&kernel, &lisp_only(), plant).unwrap_or_else(|e| panic!("{plant}: {e}"));
+        let planted = eval(&kernel, &lisp_only(), plant);
+        if refused {
+            assert!(
+                matches!(planted, Err(Error::Denied(_))),
+                "`{plant}` must be refused: {planted:?}"
+            );
+        } else {
+            planted.unwrap_or_else(|e| panic!("{plant}: {e}"));
+        }
         let seen = eval(&kernel, &lisp_only(), probe);
         assert!(
             seen.is_err(),
@@ -229,15 +241,23 @@ fn a_name_from_an_earlier_eval_is_unbound() {
         "the refusal names the identifier: {err}"
     );
 
-    // And a value never crosses: plain defines, closures, vectors, structs.
+    // And a value never crosses: plain defines, closures, vectors. (A struct cannot be
+    // planted at all: `struct` needs `make-struct-type`, which no program needs and the
+    // sandbox refuses.)
     for (plant, probe) in [
         (r#"(define leaked-value "SECRET-A") 0"#, "leaked-value"),
         (r#"(define (leakf) "SECRET-F") 0"#, "(leakf)"),
         ("(define v (vector 1 2 3)) 0", "v"),
-        ("(struct Pt (x y)) 0", "(Pt 1 2)"),
     ] {
         eval(&kernel, &lisp_only(), plant).unwrap_or_else(|e| panic!("{plant}: {e}"));
         let seen = eval(&kernel, &lisp_only(), probe);
         assert!(seen.is_err(), "{probe} after `{plant}` => {seen:?}");
     }
+    let planted = eval(&kernel, &lisp_only(), "(struct Pt (x y)) 0");
+    assert!(
+        planted.is_err(),
+        "a struct needs make-struct-type, which the sandbox refuses: {planted:?}"
+    );
+    let seen = eval(&kernel, &lisp_only(), "(Pt 1 2)");
+    assert!(seen.is_err(), "(Pt 1 2) => {seen:?}");
 }
