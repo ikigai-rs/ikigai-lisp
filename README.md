@@ -90,6 +90,32 @@ costs about 0.5 ms of its build, off the request path, and the pre-compile scree
 2 µs for `(+ 1 2)` (0.9 ms for the largest corpus program, 106 KB, whose own compile and
 run takes 27 ms).
 
+**The build is Steel's, and it grew in `steel-core` 0.8.3** (ledger #1100). 0.3.1 pins
+`=0.8.3`; 0.2.0's caret let a host's lock stay on 0.8.2, so moving a host from 0.2.0 to
+0.3.1 also moves it to the slower Steel. Building a bare `Engine::new_sandboxed()`, no
+ikigai code in the path (`cargo run --release --example steel_engine_cost`): about 42 ms
+on 0.8.2 and 68 ms on 0.8.3 in release (steady-state throughput on a busy machine), and
+0.40 s against 0.94 s with Steel unoptimized. This crate's own changes from 0.2.0 to 0.3.1 cost nothing measurable: on
+the same Steel the two build engines within noise of each other. Where the time went is
+Steel compiling its own prelude (`compile_raw_program`): 0.8.3 enlarged the prelude
+(its `ports.scm` grew from 123 lines to 318) and spends longer in its analysis pass.
+
+**A host built in debug should optimize Steel.** Cargo compiles a dependency at the
+profile's `opt-level`, so a debug build of a host or a test crate builds an
+unoptimized Steel, and an eval then waits up to a second for its engine whenever the
+pause before it is shorter than the build (`eval_cost` with `--config
+'profile.dev.package.steel-core.opt-level=0'` shows it). One stanza in the host's own
+manifest removes nearly all of it, and costs nothing in a release build:
+
+```toml
+[profile.dev.package.steel-core]
+opt-level = 3
+```
+
+Measured with `eval_cost`, a debug build on `steel-core` 0.8.3, back to back: 1.14 s per
+eval with Steel unoptimized, 0.13 s with that stanza. A profile in this crate's manifest
+cannot do it for you: Cargo applies profiles only from the workspace being built.
+
 ## Stopping a runaway
 
 The crate does not time evaluations itself: a host puts a wall-clock governor in front
