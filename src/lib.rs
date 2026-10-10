@@ -285,6 +285,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
+use steel::rerrs::{ErrorKind, SteelErr};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
 use steel::steel_vm::register_fn::RegisterFn;
@@ -673,6 +674,8 @@ impl Endpoint for LispProgram {
             )));
         }
         // The piped tuple/body is the program's DATA (via `(input)`), never its source.
+        // `content` is still read, undeclared, for the callers that name it (a reactor,
+        // `urn:decide:accept`); see `describe` for why it is not declared.
         let input = first_str(inv, &["in", "content"])?;
         let args = Args {
             program: None,
@@ -691,22 +694,25 @@ impl Endpoint for LispProgram {
             .title("Lisp program")
             .summary(
                 "A stored Lisp program run as an endpoint. The piped input (a reactor's \
-                 tuple, a body) is DATA the program reads via `(input)`, never its source. \
-                 Requires `urn:cap:lisp`.",
+                 tuple, a body) is DATA the program reads via `(input)`, never its source; \
+                 a caller may also send it as `content`. Requires `urn:cap:lisp`.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
             .requires(CAP_LISP)
+            // ONE declared input, so a positional or piped value has exactly one place to
+            // go (ledger #980). The engine fills the one declared argument left unnamed, and
+            // among several unnamed it keeps only the REQUIRED ones: with `in` and `content`
+            // both declared optional, `source <door> x` and `… | <door>` were refused as
+            // ambiguous. `in` stays optional (a program that reads no input runs bare), and
+            // `content` is still accepted at runtime for the callers that send it by name.
             .input(
                 ArgSpec::new("in")
                     .optional()
-                    .summary("the data the program reads via `(input)` (piped/positional)")
-                    .class(XSD_STRING),
-            )
-            .input(
-                ArgSpec::new("content")
-                    .optional()
-                    .summary("the `(input)` data — the piped-in alternative to `in`")
+                    .summary(
+                        "the data the program reads via `(input)` (piped/positional; \
+                         `content` is accepted too)",
+                    )
                     .class(XSD_STRING),
             )
             .output(TEXT_PLAIN_UTF8)
@@ -787,8 +793,9 @@ pub const CAP_LISP_RUN: &str = "urn:cap:lisp:run";
 /// 3. **Compute**: the same worker ceiling and (on served surfaces) Timeout
 ///    governor as `urn:lisp:eval`.
 ///
-/// The signature covers the PROGRAM (`in`) only. Piped `content` (or `data=`) is
-/// the program's unsigned `(input)` DATA — data is data, never code: the same
+/// The signature covers the PROGRAM (`in`) only. `data` (a piped or positional value
+/// lands there, and `content` by name is read the same) is the program's unsigned
+/// `(input)` DATA — data is data, never code: the same
 /// source/input separation [`LispProgram`] enforces.
 ///
 /// What a host serving this door should know:
@@ -872,7 +879,8 @@ impl Endpoint for SignedRun {
         // Gates 2 + 3 live in run_eval: the session's capability bounds every
         // sub-request; the worker ceiling (and any Timeout overlay fronting this
         // binding) bounds compute. Piped/`data=` input is reachable via
-        // `(input)` — unsigned DATA, never evaluated.
+        // `(input)` — unsigned DATA, never evaluated. `content` is still read,
+        // undeclared, for a caller that names it (see `describe`).
         let input = first_str(inv, &["data", "content"])?;
         let args = Args {
             program: Some("in"),
@@ -895,8 +903,8 @@ impl Endpoint for SignedRun {
                  trust set, and whose signature must verify (via urn:sign:verify) before \
                  anything evaluates. The signature gates what may run; the session capability \
                  still gates what it may touch; the worker ceiling and any Timeout overlay \
-                 bound compute. Piped content (or data=) is the program's unsigned (input) \
-                 data, never code. Requires `urn:cap:lisp:run`.",
+                 bound compute. A piped value (data=, or content=) is the program's \
+                 unsigned (input) data, never code. Requires `urn:cap:lisp:run`.",
             )
             .verb(Verb::Source)
             .verb(Verb::Meta)
@@ -916,16 +924,17 @@ impl Endpoint for SignedRun {
                     .summary("the public-key resource IRI (must be in the host's trust set)")
                     .class(XSD_STRING),
             )
+            // `data` is the one input left once `in`, `sig` and `key` are named, so a
+            // positional or piped value routes to it; a second optional `content` beside
+            // it made the engine refuse the value as ambiguous (ledger #980). `content` is
+            // still accepted at runtime.
             .input(
                 ArgSpec::new("data")
                     .optional()
-                    .summary("unsigned data the program reads via `(input)` (or piped)")
-                    .class(XSD_STRING),
-            )
-            .input(
-                ArgSpec::new("content")
-                    .optional()
-                    .summary("the unsigned `(input)` data — the piped-in alternative to `data`")
+                    .summary(
+                        "unsigned data the program reads via `(input)` (piped/positional; \
+                         `content` is accepted too)",
+                    )
                     .class(XSD_STRING),
             )
             .output(TEXT_PLAIN_UTF8)
@@ -1277,20 +1286,35 @@ fn stopped() -> Error {
 /// saturated dependency, would reach the caller as an opaque endpoint failure:
 /// permanent-looking, nothing a Retry overlay or an agent can act on without
 /// sniffing the message. Instead every kernel error a sub-request returned is
-/// recorded typed, in program order, and when the uncaught error carries one of
-/// them verbatim (Steel quotes the message, so both spellings are tried), that
-/// typed error is the eval's result. An error the program caught and recovered
-/// from is not in the final text, so it stays caught; a program's own `(error …)`
-/// matches nothing and stays an `Endpoint` error.
+/// recorded typed, in program order, and when the uncaught error IS one of them,
+/// untouched ([`uncaught_text`]), that typed error is the eval's result.
+///
+/// The match is EXACT, never a substring (ledger #980). The failures include the
+/// ones the program CAUGHT, so a program that catches a refusal and raises its own
+/// error quoting it — `(error (string-append "drain: refused: " (to-string e)))` —
+/// carries a recorded failure's text inside its own, and a substring match threw the
+/// program's words away and answered with the refusal it quoted. A program's own
+/// `(error …)` is never mistaken for a verb's: Steel renders it with a space before
+/// the first argument and never as a quoted literal, so it stays an `Endpoint` error.
 fn retype_uncaught(result: Result<String>, failures: &[Error]) -> Result<String> {
     let Err(Error::Endpoint(text)) = result else {
         return result;
     };
-    let typed = failures.iter().rev().find(|failure| {
-        let shown = failure.to_string();
-        text.contains(&shown) || text.contains(&format!("{shown:?}"))
-    });
+    let typed = failures
+        .iter()
+        .rev()
+        .find(|failure| text == uncaught_text(failure));
     Err(typed.cloned().unwrap_or(Error::Endpoint(text)))
+}
+
+/// The exact text a verb failure the program did NOT catch leaves the eval with: the
+/// builtin returned the kernel error's text as its `Err`, which Steel raises as a
+/// `Generic` error carrying that text as a string literal, and [`run_program`] prefixes
+/// `lisp: `. Built with Steel's own [`SteelErr`] rendering, so the shape is Steel's,
+/// not a copy of it (pinned by the exact `=0.8.3` dependency and `tests/retype.rs`).
+fn uncaught_text(failure: &Error) -> String {
+    let raised = SteelErr::new(ErrorKind::Generic, format!("{:?}", failure.to_string()));
+    format!("lisp: {raised}")
 }
 
 /// The human-readable half of a panic payload, which is a `&str` or a `String`.
