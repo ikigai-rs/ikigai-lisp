@@ -26,7 +26,9 @@ Two layers, both required:
    (`with-handler`) — never a panic. Left uncaught, it leaves the eval as that
    same typed `Denied` (and a sub-request's `Unavailable`/`Timeout` stays
    transient), so a caller, a Retry overlay or an agent sees the resource's
-   refusal rather than an opaque endpoint string.
+   refusal rather than an opaque endpoint string. Only the failure itself, untouched,
+   is retyped: a program that catches it and raises its own error, even one quoting
+   it, keeps its own words.
 
 Both layers rest on the sandbox below: the verbs are the ONLY way out.
 
@@ -250,6 +252,13 @@ should know:
 
 Every door serves Source (and Meta, from its description); an Exists, Sink or Delete is
 refused rather than running the program.
+
+Every door can be piped into. A stored program (`ikigai_lisp::program`) declares ONE
+input, `in`, optional, so a positional value (`source <door> hello`) and a piped one
+(`… | <door>`) both reach `(input)`; `urn:lisp:run` routes the value to `data` once `in`, `sig` and `key`
+are named. Both still accept `content` from a caller that sends it by name (a reactor,
+`urn:decide:accept`), but do not declare it: a second optional input leaves the REPL
+engine two places to put a value and it refuses the line (`tests/pipeline.rs`).
 
 Native-only: the synchronous Steel engine reaches the async kernel through core's
 `Invocation::scope_sync` bridge (real threads), so there is no wasm face yet. Builtin-set filtering by capability

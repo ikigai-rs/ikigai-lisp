@@ -13,6 +13,10 @@ name = "ikigai-lisp"
 # adopt it deliberately. Floor: ikigai-core 0.1.89, where `bind` drops a name.
 # 0.3.1 (ledger #921): steel-core pinned `=0.8.3`, the one Steel the allowlist was checked
 # against, and the crate no longer creates Steel's home directory (nothing reads it).
+# Also in 0.3.1 (ledger #980): every door can be piped into — a stored program declares only
+# `in` and `urn:lisp:run` only `data` beside its named three (both still READ `content`), and
+# an uncaught verb failure is retyped only when it is the failure itself, untouched, so a
+# program's own error quoting a caught one keeps its words.
 version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -82,6 +86,15 @@ ikigai-fn = "0.4.0"
 # verb path, not a build link). `^0.1.5` unifies with lisp's ikigai-core (both 0.1.x),
 # so one kernel type is linked across the test.
 ikigai-sparql = "0.1.5"
+
+# ★ The REPL engine, for `tests/pipeline.rs` (ledger #980). Whether a positional or piped
+# value reaches a door is decided by the engine's routing rule (a Source fills the ONE declared
+# argument left unnamed), not by the kernel, so only the real engine can show it. Dev-only.
+# `^0.1.43` unifies with this crate's ikigai-core caret (the engine asks for `^0.1.87`).
+ikigai-engine = "0.1.43"
+# The engine reads each contract as `Meta as=application/json`; the test kernel must answer,
+# or the engine fails OPEN and routes every value to `in`, proving nothing.
+serde_json = "1"
 
 # Every evaluation builds its own Steel engine (isolation: see the module docs), and an
 # unoptimized Steel takes ~1 s to build one where an optimized one takes ~60 ms. Optimize

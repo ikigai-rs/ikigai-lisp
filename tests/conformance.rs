@@ -506,26 +506,32 @@ fn declared_outputs_are_the_media_types_served() {
     }
 }
 
-/// `content` is declared on every door and read where it is declared: the
-/// s-expression for `urn:lisp:eval`, the `(input)` data for a stored program and
-/// for the signed-run door. PIPELINE fires each with `content=x` and reports only
-/// a `MissingArgument`; that the value ARRIVES is pinned here.
+/// `content` is read by every door: the s-expression for `urn:lisp:eval`, the
+/// `(input)` data for a stored program and for the signed-run door. PIPELINE fires
+/// each with `content=x` and reports only a `MissingArgument`; that the value ARRIVES
+/// is pinned here.
+///
+/// Only the eval DECLARES it (ledger #980). The eval's `in` is required, so the engine
+/// still routes a positional or piped value there; a stored program's `in` and the
+/// signed run's `data` are optional, and a second optional `content` beside either left
+/// the engine two places for the value, so it refused the line. Those two read
+/// `content` for the callers that name it (a reactor, `urn:decide:accept`) without
+/// declaring it; `tests/pipeline.rs` drives the routing through the real engine.
 #[test]
 fn content_drives_every_door() {
     let kernel = kernel();
-    for iri in [EVAL_IRI, RUN_IRI, ECHO_IRI] {
+    for (iri, declared) in [(EVAL_IRI, true), (RUN_IRI, false), (ECHO_IRI, false)] {
         let description = kernel
             .describe(&Iri::parse(iri).unwrap())
             .unwrap_or_else(|| panic!("{iri} describes itself"));
-        let content = description
-            .inputs
-            .iter()
-            .find(|i| i.name == "content")
-            .unwrap_or_else(|| panic!("{iri} declares `content`"));
-        assert!(
-            !content.required,
-            "{iri}: `content` is the piped alternative"
-        );
+        let content = description.inputs.iter().find(|i| i.name == "content");
+        match content {
+            Some(content) => assert!(
+                declared && !content.required,
+                "{iri}: `content` is declared only on the eval, and optional there"
+            ),
+            None => assert!(!declared, "{iri} must declare `content`"),
+        }
     }
 
     // The eval: piped content IS the program when `in` is absent.
