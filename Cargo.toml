@@ -63,7 +63,12 @@ ikigai-throttle = "0.1.6"
 # 0.2.0 is the true minimum: it moved fn's own names into the `urn:iki:` namespace,
 # and `space()` binds ONLY `urn:iki:fn:*` — no alias, because a module does not set
 # binding policy for its hosts. Test-only, so this pin says nothing to consumers.
-ikigai-fn = "0.2.0"
+# Pinned to the CURRENT line, not that floor: a 0.x caret is a ceiling too, and
+# `"0.2.0"` (`<0.3.0`) left the oracle running fn 0.2.1 while fn moved to 0.4.0.
+# 0.4.0 names its space `urn:iki:space:fn` (ledger #987); the test kernels extend
+# that space with `bind`, which drops the name (core 0.1.89), so this also proves
+# a host can extend a named sibling space with lisp's doors.
+ikigai-fn = "0.4.0"
 # The real SPARQL engine, so the `(sparql-select …)` oracle runs a compiled query
 # end-to-end through `urn:sparql:select` — dev-dep ONLY (runtime reaches it via the
 # verb path, not a build link). `^0.1.5` unifies with lisp's ikigai-core (both 0.1.x),
