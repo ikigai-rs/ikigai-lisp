@@ -11,7 +11,9 @@ name = "ikigai-lisp"
 # 0.3.0 NAMES THE SPACE (ledger #987): `space()` claims `urn:iki:space:lisp` (`SPACE_ID`). A minor bump because
 # the name changes `answered_by`, `urn:kernel:topology` and cache partitioning for every host that mounts it; hosts
 # adopt it deliberately. Floor: ikigai-core 0.1.89, where `bind` drops a name.
-version = "0.3.0"
+# 0.3.1 (ledger #921): steel-core pinned `=0.8.3`, the one Steel the allowlist was checked
+# against, and the crate no longer creates Steel's home directory (nothing reads it).
+version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -38,10 +40,16 @@ async-trait = "0.1"
 # 0.1.1 introduced `sexpr_to_turtle`; pin 0.1.2 (the current published line).
 ikigai-sexpr = "0.1.2"
 # The Scheme engine; its builtins are the kernel verbs. 0.8 is the current
-# embedding API (`Engine::run`, `register_fn`). A warm `new_sandboxed` template
-# is built once per pooled worker and cloned per eval (~0.2 ms) — building a full
-# VM per eval cost ~50 ms.
-steel-core = "0.8.2"
+# embedding API (`Engine::run`, `register_fn`).
+# PINNED EXACTLY (ledger #921): the sandbox's allowlist is DERIVED from Steel's compiled
+# stdlib (`src/sandbox.rs`), and its pins were checked against 0.8.3 alone — they do not
+# even compile on 0.8.2 (`CompiledModule::get_compiled_ast` is new in 0.8.3), and a patch
+# release moves stdlib internals (0.8.2 -> 0.8.3 changed stdlib.scm and the macro kernel).
+# A caret (or `~0.8.3`, the same range under 0.x) would admit a 0.8.4 nobody has checked.
+# `=` means every Steel this runs on was checked by CI; a Steel upgrade is a release of
+# this crate, with the allowlist re-derived. No other ikigai crate depends on steel-core,
+# so the exact pin cannot split a consumer's graph.
+steel-core = "=0.8.3"
 [dev-dependencies]
 # Test executor (`block_on`, `now_or_never`) only — the sync↔async bridge itself
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
