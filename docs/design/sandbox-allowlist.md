@@ -161,11 +161,15 @@ port. The ikigai-programs corpus runs unchanged (177 tests).
 
 ## Not covered here
 
-- **Which Steel.** The lists are verified against the locked `steel-core` (0.8.3). The
-  manifest's `"0.8.2"` lets a consumer resolve another 0.8.x; there the sandbox fails
-  CLOSED (an internal it does not list is refused, so a stdlib function breaks), never
-  open. Pinning Steel exactly would make "every Steel this runs on was pinned by CI" true
-  for consumers too; that is a manifest policy decision, not made here.
+- **Which Steel.** The lists are verified against `steel-core` 0.8.3, and since 0.3.1 the
+  manifest pins it exactly (`=0.8.3`, ledger #921), so every Steel this runs on was
+  checked by CI, for consumers too. A caret (`"0.8.2"` until then) admitted another 0.8.x,
+  where the sandbox would fail CLOSED (an internal it does not list is refused, so a
+  stdlib function breaks), never open. Measured on 0.8.2 when the pin was made: every
+  program name and macro on the lists behaved as on 0.8.3, but the pins themselves do not
+  compile there (`CompiledModule::get_compiled_ast` is new in 0.8.3), so "it works on
+  0.8.2" was never something CI could say. A Steel upgrade is a release of this crate:
+  move the pin, and the pins re-derive the lists.
 - **Steel's own kernel transformers** (`struct`, `define-values`) still run in the macro
   kernel on program syntax. They are Steel's code treating that syntax as data; none
   evaluates it.
