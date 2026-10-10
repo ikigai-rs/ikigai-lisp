@@ -8,7 +8,10 @@ name = "ikigai-lisp"
 # cost ~63 ms of build, accepted 2026-10-09). A timed-out runaway is interrupted. `Limits`/`set_limits` (stack,
 # program/input bytes, nesting) replace IKIGAI_LISP_WORKERS. Hosts must wrap the binding in a Timeout to stop a
 # runaway (ikigai-cli: ledger #920).
-version = "0.2.0"
+# 0.3.0 NAMES THE SPACE (ledger #987): `space()` claims `urn:iki:space:lisp` (`SPACE_ID`). A minor bump because
+# the name changes `answered_by`, `urn:kernel:topology` and cache partitioning for every host that mounts it; hosts
+# adopt it deliberately. Floor: ikigai-core 0.1.89, where `bind` drops a name.
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
