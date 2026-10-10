@@ -277,8 +277,8 @@
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Expiry, Invocation, Iri,
-    ReprType, Representation, Request, Result, SyncIssuer, Verb,
+    space_iri, ArgRef, ArgSpec, Description, Endpoint, EndpointSpace, Error, Exact, Expiry,
+    Invocation, Iri, ReprType, Representation, Request, Result, SyncIssuer, Verb,
 };
 use ikigai_sexpr::Sexpr;
 use std::cell::RefCell;
@@ -426,12 +426,21 @@ pub fn eval() -> LispEval {
     LispEval
 }
 
+/// The name [`space`] claims: `urn:iki:space:lisp`.
+pub const SPACE_ID: &str = "urn:iki:space:lisp";
+
 /// Mount the module at its conventional IRI (`urn:lisp:eval`). A host links this
 /// crate and mounts the returned space; the running principal's
 /// [`Capability`](ikigai_core::Capability) then gates both the eval itself and
 /// every verb the program reaches.
+///
+/// The space names itself [`SPACE_ID`]: it is configuration-free, because nothing is
+/// read while building it. The [`Limits`] and steel's home are read when an eval
+/// runs, not here. Binding another door onto it drops the name (core 0.1.89).
 pub fn space() -> EndpointSpace {
-    EndpointSpace::new().bind(Exact::new("urn:lisp:eval"), eval())
+    EndpointSpace::new()
+        .bind(Exact::new("urn:lisp:eval"), eval())
+        .named(space_iri("lisp"))
 }
 
 #[async_trait]

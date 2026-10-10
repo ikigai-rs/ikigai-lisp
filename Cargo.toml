@@ -23,8 +23,10 @@ categories = ["compilers", "caching"]
 # The released kernel, consumed from crates.io — the SAME version the hosts use,
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
 # 0.1.50 carries `Invocation::scope_sync` + `SyncIssuer` — the sync-eval bridge
-# this crate proved privately, now consumed from core (the true minimum).
-ikigai-core = "0.1.50"
+# this crate proved privately, now consumed from core. 0.1.89 is the true minimum:
+# `space_iri` names `space()` (ledger #987), and `bind` drops a name, so a host that
+# extends this space does not carry `urn:iki:space:lisp` over different doors.
+ikigai-core = "0.1.89"
 async-trait = "0.1"
 # The neutral s-expression foundation — owns the pure `sexpr_to_sparql` (query) and
 # `sexpr_to_turtle` (graph) compilers over its language-agnostic `Sexpr` datum (single
@@ -42,9 +44,10 @@ steel-core = "0.8.2"
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`): walks every endpoint the
-# fixture kernel binds and reports every violation at once. Dev-only, and it pins
-# `ikigai-core ^0.1.67`, which unifies with this crate's caret on the 0.1 line.
-ikigai-conformance = "0.2.0"
+# fixture kernel binds and reports every violation at once. Dev-only. 0.6.0 adds
+# SPACE-NAME (ledger #987) and pins `ikigai-core ^0.1.89`, which unifies with this
+# crate's caret on the 0.1 line. A 0.x caret is a CEILING too: `"0.6.0"` is `<0.7.0`.
+ikigai-conformance = "0.6.0"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
 # genuine urn:sign:verify (module composition, not a stub).
 ikigai-sign = "0.2.0"

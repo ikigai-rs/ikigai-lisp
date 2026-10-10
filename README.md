@@ -227,6 +227,8 @@ let space = ikigai_lisp::space(); // binds urn:lisp:eval
 // mount into your kernel alongside the other modules, behind a Timeout overlay
 ```
 
+The space names itself `urn:iki:space:lisp` (`ikigai_lisp::SPACE_ID`).
+
 Set the bounds first if the defaults do not fit (above), and put a `Timeout` in front
 of every binding — the embedded one too: it is what stops a runaway.
 

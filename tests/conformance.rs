@@ -43,6 +43,13 @@
 //!   only reports a `MissingArgument`; that the piped value actually reaches the
 //!   program is asserted here.
 //!
+//! ## The space's name
+//!
+//! `ikigai_lisp::space()` is configuration-free (it binds one unit-struct endpoint
+//! and reads nothing while building), so it is declared self-named and SPACE-NAME
+//! holds it to `urn:iki:space:lisp`, the same doors on every call. The fixture
+//! kernel above does not use it: it binds the doors onto the sign space instead.
+//!
 //! No opt-outs, and NAMES runs: every id is kebab-case.
 
 use std::sync::Arc;
@@ -75,11 +82,18 @@ const VAULT_READER_IRI: &str = "urn:conformance:vault-reader";
 /// A resource whose Source requires [`CAP_VAULT`]; readable under root.
 const VAULT_IRI: &str = "urn:conformance:vault";
 const CAP_VAULT: &str = "urn:cap:conformance:vault";
-/// A resource served cacheable under a golden thread named after itself.
+/// A resource served cacheable under a golden thread named for its STATE.
 const THREADED_IRI: &str = "urn:conformance:threaded";
 /// The keypair, bound as kernel resources the way `urn:file:<pem>` would be.
 const PRIVATE_IRI: &str = "urn:conformance:key:private";
 const PUBLIC_IRI: &str = "urn:conformance:key:public";
+/// The threads the cacheable fixtures hang from, named after the state they read
+/// rather than the IRI they are read through: since core 0.1.73 the kernel hangs every
+/// cacheable read on its own name anyway, so a thread named after the endpoint reads
+/// as no thread at all, and conformance 0.5.0+ reports it (CACHEABLE).
+const THREADED_STATE: &str = "urn:conformance:state:threaded";
+const PRIVATE_STATE: &str = "urn:conformance:state:key:private";
+const PUBLIC_STATE: &str = "urn:conformance:state:key:public";
 
 /// The program every fired action evaluates: pure, so the walk is deterministic.
 const PROGRAM: &str = "(+ 40 2)";
@@ -155,7 +169,7 @@ fn kernel() -> Kernel {
                 media: "application/x-pem-file",
                 body: PRIVATE_PEM,
                 requires: None,
-                thread: Some(PRIVATE_IRI),
+                thread: Some(PRIVATE_STATE),
             },
         )
         .bind(
@@ -165,7 +179,7 @@ fn kernel() -> Kernel {
                 media: "application/x-pem-file",
                 body: PUBLIC_PEM,
                 requires: None,
-                thread: Some(PUBLIC_IRI),
+                thread: Some(PUBLIC_STATE),
             },
         )
         .bind(
@@ -185,7 +199,7 @@ fn kernel() -> Kernel {
                 media: "text/plain",
                 body: "v1",
                 requires: None,
-                thread: Some(THREADED_IRI),
+                thread: Some(THREADED_STATE),
             },
         );
     Kernel::new(Arc::new(space))
@@ -255,6 +269,7 @@ fn suite(graph: &str) -> Suite {
         )
         .cacheable(SIGN)
         .cacheable(VERIFY)
+        .self_named_space("lisp", ikigai_lisp::space)
 }
 
 /// The walk saw the four lisp endpoints, the two sign endpoints and the four
@@ -281,6 +296,10 @@ fn conforms() {
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
+    assert_eq!(
+        ikigai_core::space_iri("lisp").as_str(),
+        ikigai_lisp::SPACE_ID
+    );
 }
 
 /// The cacheability decision, in the code's own terms and then in the suite's.
@@ -325,12 +344,14 @@ fn an_eval_is_live_until_its_program_says_otherwise() {
     let repr = issue(&kernel, over_threaded.clone(), &cap);
     assert_eq!(text(&repr), "v1");
     assert!(
-        repr.threads().iter().any(|t| t.to_string() == THREADED_IRI),
+        repr.threads()
+            .iter()
+            .any(|t| t.to_string() == THREADED_STATE),
         "the sourced resource's thread flows onto the eval: {:?}",
         repr.threads()
     );
     assert!(kernel.is_cached(&over_threaded, &cap));
-    kernel.cut(THREADED_IRI);
+    kernel.cut(THREADED_STATE);
     assert!(
         !kernel.is_cached(&over_threaded, &cap),
         "cutting the sourced thread invalidates the cached eval"
