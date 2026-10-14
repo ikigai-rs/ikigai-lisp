@@ -50,18 +50,18 @@
 //! holds it to `urn:iki:space:lisp`, the same doors on every call. The fixture
 //! kernel above does not use it: it binds the doors onto the sign space instead.
 //!
-//! ## REQUIRED, and the one waiver: it is the signing module's, pinned exactly
+//! ## REQUIRED holds every door, the composed sign doors included: no waiver
 //!
-//! conformance 0.8.0's REQUIRED drops each required input and expects a typed
-//! `MissingArgument`/`InvalidArgument`. The four lisp doors all refuse that way. The
-//! composed `ikigai-sign` endpoints do not: `sign` and `verify` refuse a missing
-//! `in`, `sig` or `key` as an untyped `Error::Endpoint` (sign 0.2.3 through 0.3.0).
-//! That is sign's declaration to fix, in sign's repository, not this one's, so
-//! [`suite`] waives REQUIRED on those two ids with the reason printed, and
-//! [`the_required_waivers_are_exactly_signs_untyped_refusals`] holds the waiver to
-//! the five findings it covers, so it goes red in both directions: a new finding
-//! fails, and so does the day a sign release types its refusals and the waiver is
-//! no longer needed.
+//! conformance's REQUIRED drops each required input and expects a typed
+//! `MissingArgument`/`InvalidArgument`. The four lisp doors all refuse that way, and
+//! since sign 0.3.1 so do the composed `ikigai-sign` endpoints. Through sign 0.3.0
+//! `sign` and `verify` refused a missing `in`, `sig` or `key` as an untyped
+//! `Error::Endpoint`, and [`suite`] carried a REQUIRED waiver on those two ids,
+//! pinned to exactly those five findings so it would go red the day sign typed them.
+//! It did (ledger #1515): with sign 0.3.2 the waiver suppressed nothing (conformance
+//! 0.8.1+ prints that as a `note:`), so it is gone, and
+//! [`the_composed_sign_doors_refuse_a_missing_input_typed`] holds the five refusals
+//! by their evidence rather than by the absence of a finding.
 //!
 //! NAMES runs: every id is kebab-case.
 
@@ -258,8 +258,8 @@ fn lisp() -> Capability {
 /// where the suite's `x` is not a program, the signed graph where its `x` is not a
 /// signature, and the sign endpoints' own fixtures. No `pure`, no `cacheable` on
 /// any lisp door; the two sign results are held to the cache over this threaded
-/// keystore, as their own suite holds them. No waiver: [`suite`] adds the one.
-fn walk(graph: &str) -> Suite {
+/// keystore, as their own suite holds them. No waiver on any door.
+fn suite(graph: &str) -> Suite {
     Suite::new()
         .namespace(ikigai_sign::SIG_NS)
         .fixture(Fixture::new(EVAL, Verb::Source).arg("in", PROGRAM))
@@ -283,20 +283,6 @@ fn walk(graph: &str) -> Suite {
         .cacheable(SIGN)
         .cacheable(VERIFY)
         .self_named_space("lisp", ikigai_lisp::space)
-}
-
-/// Why REQUIRED is waived on the two composed sign endpoints (the file docs say more).
-const SIGN_REQUIRED_WAIVER: &str = "ikigai-sign's own refusal: a missing required input \
-    comes back as an untyped Error::Endpoint, not MissingArgument (sign 0.2.3..=0.3.0), to be \
-    fixed in ikigai-sign; pinned exactly by \
-    the_required_waivers_are_exactly_signs_untyped_refusals";
-
-/// [`walk`] with the one waiver this module needs: REQUIRED on the composed sign
-/// endpoints, whose refusals are sign's to type.
-fn suite(graph: &str) -> Suite {
-    walk(graph)
-        .opt_out_check(SIGN, Check::Required, SIGN_REQUIRED_WAIVER)
-        .opt_out_check(VERIFY, Check::Required, SIGN_REQUIRED_WAIVER)
 }
 
 /// The walk saw the four lisp endpoints, the two sign endpoints and the four
@@ -329,54 +315,39 @@ fn conforms() {
     );
 }
 
-/// The REQUIRED waiver in [`suite`] covers exactly sign's five untyped refusals and
-/// nothing else: the walk without it reports those five and only those, so a new
-/// REQUIRED finding on any door is not hidden by it, and a sign release that types
-/// its refusals turns this red until the waiver is dropped.
+/// REQUIRED walked the composed sign doors and each refused typed: the five inputs it
+/// dropped there (`sign` without `in` or `key`, `verify` without `in`, `sig` or `key`)
+/// each came back `missing-argument`. A clean report alone cannot say this, since a
+/// REQUIRED that dropped nothing there would be clean too. These are the refusals the
+/// old waiver covered while sign typed them as `Error::Endpoint` (through sign 0.3.0).
 #[test]
-fn the_required_waivers_are_exactly_signs_untyped_refusals() {
+fn the_composed_sign_doors_refuse_a_missing_input_typed() {
     let kernel = kernel();
     let graph = sign(&kernel, PROGRAM);
-    let report = walk(&graph).run_blocking(&kernel);
-    let mut got: Vec<(String, Option<Verb>, Check, bool)> = report
-        .findings
+    let report = suite(&graph).run_blocking(&kernel);
+    assert!(report.idle_waivers().is_empty(), "{report}");
+    let mut got: Vec<(&str, &str, Option<&str>)> = report
+        .required_probes()
         .iter()
-        .map(|f| {
-            (
-                f.endpoint.clone(),
-                f.verb,
-                f.check,
-                f.detail.contains("not as a typed `MissingArgument`"),
-            )
+        .filter(|p| p.endpoint == SIGN || p.endpoint == VERIFY)
+        .map(|p| {
+            assert_eq!(p.verb, Verb::Source, "{report}");
+            (p.endpoint.as_str(), p.input.as_str(), p.refusal.as_deref())
         })
         .collect();
-    got.sort_by(|a, b| a.0.cmp(&b.0));
-    let expected: Vec<(String, Option<Verb>, Check, bool)> = [(SIGN, 2), (VERIFY, 3)]
-        .into_iter()
-        .flat_map(|(id, n)| {
-            std::iter::repeat_n(
-                (id.to_string(), Some(Verb::Source), Check::Required, true),
-                n,
-            )
-        })
-        .collect();
-    assert_eq!(got, expected, "{report}");
-    for (id, input) in [
-        (SIGN, "in"),
-        (SIGN, "key"),
-        (VERIFY, "in"),
-        (VERIFY, "sig"),
-        (VERIFY, "key"),
-    ] {
-        let named = format!("without the required `{input}`");
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|f| f.endpoint == id && f.detail.contains(&named)),
-            "{id} `{input}`: {report}"
-        );
-    }
+    got.sort();
+    let typed = Some("missing-argument");
+    assert_eq!(
+        got,
+        [
+            (SIGN, "in", typed),
+            (SIGN, "key", typed),
+            (VERIFY, "in", typed),
+            (VERIFY, "key", typed),
+            (VERIFY, "sig", typed),
+        ],
+        "{report}"
+    );
 }
 
 /// The cacheability decision, in the code's own terms and then in the suite's.
