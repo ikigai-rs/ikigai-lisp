@@ -63,11 +63,17 @@ futures = "0.3"
 # REQUIRED (ledger #329), VALIDATE (0.7.0) and the fixture-argument DECLARATIONS
 # finding, and pins `ikigai-core ^0.1.100`, which unifies with this crate's caret on
 # the 0.1 line (tests only: the library's own floor stays where its API needs it).
-# A 0.x caret is a CEILING too: `"0.8.0"` is `<0.9.0`.
-ikigai-conformance = "0.8.0"
+# 0.8.1 is the true minimum now: `Report::required_probes` and `idle_waivers` (ledger
+# #1493) hold the composed sign doors' typed refusals by their evidence, now that sign's
+# REQUIRED waiver is gone (ledger #1515). A 0.x caret is a CEILING too: `"0.8.1"` is `<0.9.0`.
+ikigai-conformance = "0.8.1"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
-# genuine urn:sign:verify (module composition, not a stub).
-ikigai-sign = "0.2.0"
+# genuine urn:sign:verify (module composition, not a stub). Dev-only.
+# Sign 0.3.1 types a missing required input as `MissingArgument` (0.3.2 also types an
+# unparseable key IRI as `InvalidArgument`), so the conformance walk's REQUIRED holds the
+# composed sign doors with no waiver (ledger #1515); 0.3.2 is the current line.
+# A 0.x caret is a CEILING too: the old `"0.2.0"` (`<0.3.0`) kept this on sign 0.2.x.
+ikigai-sign = "0.3.2"
 
 # The wall-clock Timeout overlay — proves the wire-eval L1 governor end to end:
 # the async servicing loop yields, so the racing timer actually fires mid-eval.
@@ -85,9 +91,10 @@ ikigai-throttle = "0.1.6"
 ikigai-fn = "0.4.0"
 # The real SPARQL engine, so the `(sparql-select …)` oracle runs a compiled query
 # end-to-end through `urn:sparql:select` — dev-dep ONLY (runtime reaches it via the
-# verb path, not a build link). `^0.1.5` unifies with lisp's ikigai-core (both 0.1.x),
-# so one kernel type is linked across the test.
-ikigai-sparql = "0.1.5"
+# verb path, not a build link). It unifies with lisp's ikigai-core caret (both on the
+# 0.1.x kernel line), so one kernel type is linked across the test. Pinned to the current
+# line: the old `"0.1.5"` was a ceiling (`<0.2.0`) below sparql 0.2.5 (ledger #1515).
+ikigai-sparql = "0.2.5"
 
 # ★ The REPL engine, for `tests/pipeline.rs` (ledger #980). Whether a positional or piped
 # value reaches a door is decided by the engine's routing rule (a Source fills the ONE declared
