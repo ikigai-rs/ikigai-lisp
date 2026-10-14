@@ -59,10 +59,12 @@ steel-core = "=0.8.3"
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`): walks every endpoint the
-# fixture kernel binds and reports every violation at once. Dev-only. 0.6.0 adds
-# SPACE-NAME (ledger #987) and pins `ikigai-core ^0.1.89`, which unifies with this
-# crate's caret on the 0.1 line. A 0.x caret is a CEILING too: `"0.6.0"` is `<0.7.0`.
-ikigai-conformance = "0.6.0"
+# fixture kernel binds and reports every violation at once. Dev-only. 0.8.0 adds
+# REQUIRED (ledger #329), VALIDATE (0.7.0) and the fixture-argument DECLARATIONS
+# finding, and pins `ikigai-core ^0.1.100`, which unifies with this crate's caret on
+# the 0.1 line (tests only: the library's own floor stays where its API needs it).
+# A 0.x caret is a CEILING too: `"0.8.0"` is `<0.9.0`.
+ikigai-conformance = "0.8.0"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
 # genuine urn:sign:verify (module composition, not a stub).
 ikigai-sign = "0.2.0"
