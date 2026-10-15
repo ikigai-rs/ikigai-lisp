@@ -7,9 +7,9 @@ runs an s-expression whose builtins **are the kernel verbs** — `source`, `sink
 eval's own capability. Code is a resource; the capability is the builtin set.
 
 ```text
-source urn:lisp:eval '(source "urn:fn:toUpper" "hi")'   # -> HI
-source urn:lisp:eval '(+ 1 2)'                           # -> 3
-source urn:lisp:eval '(map (lambda (w) (source "urn:fn:toUpper" w)) (list "a" "b"))'
+source urn:lisp:eval '(source "urn:iki:fn:toUpper" "hi")'   # -> HI
+source urn:lisp:eval '(+ 1 2)'                               # -> 3
+source urn:lisp:eval '(map (lambda (w) (source "urn:iki:fn:toUpper" w)) (list "a" "b"))'
 ```
 
 ## Capability model
