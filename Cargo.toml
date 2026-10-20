@@ -65,8 +65,11 @@ futures = "0.3"
 # the 0.1 line (tests only: the library's own floor stays where its API needs it).
 # 0.8.1 is the true minimum now: `Report::required_probes` and `idle_waivers` (ledger
 # #1493) hold the composed sign doors' typed refusals by their evidence, now that sign's
-# REQUIRED waiver is gone (ledger #1515). A 0.x caret is a CEILING too: `"0.8.1"` is `<0.9.0`.
-ikigai-conformance = "0.8.1"
+# REQUIRED waiver is gone (ledger #1515). 0.9.0 adds core 0.1.105's contract-shape checks
+# (REQUIRED probes input groups, OUTPUTS honors output_from, PIPELINE's named-only line,
+# VALIDATE refuses a default on a binding) and RECOMPUTE; 0.10.0 adds FAILURES (off unless a
+# suite opts in). A 0.x caret is a CEILING too: `"0.10.0"` is `<0.11.0`.
+ikigai-conformance = "0.10.0"
 # The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
 # genuine urn:sign:verify (module composition, not a stub). Dev-only.
 # Sign 0.3.1 types a missing required input as `MissingArgument` (0.3.2 also types an
