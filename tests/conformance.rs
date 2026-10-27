@@ -286,8 +286,8 @@ fn suite(graph: &str) -> Suite {
 }
 
 /// The walk saw the four lisp endpoints, the two sign endpoints and the four
-/// fixture resources — one Source action each — and skipped only the opt-in FAILURES
-/// check (`check_failures()` is the next wave). An endpoint
+/// fixture resources — one Source action each — with every check running, including
+/// DATATYPES and FAILURES (enabled by default since conformance 0.11.0). An endpoint
 /// bound without a line here would be held to a weaker standard; a declared id
 /// that binds nothing is a stale list.
 fn assert_shape(report: &Report) {
@@ -298,11 +298,7 @@ fn assert_shape(report: &Report) {
     );
     assert_eq!(report.actions, 10, "one Source action each: {report}");
     let skipped: Vec<Check> = report.checks.skipped().collect();
-    assert_eq!(
-        skipped,
-        [Check::Failures],
-        "every check but FAILURES ran: {report}"
-    );
+    assert!(skipped.is_empty(), "every check ran: {report}");
 }
 
 #[test]
