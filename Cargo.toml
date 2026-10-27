@@ -17,7 +17,9 @@ name = "ikigai-lisp"
 # `in` and `urn:lisp:run` only `data` beside its named three (both still READ `content`), and
 # an uncaught verb failure is retyped only when it is the failure itself, untouched, so a
 # program's own error quoting a caught one keeps its words.
-version = "0.3.1"
+# 0.4.0 (ledger #2353): adopt core 0.2, the streams release (ledger #2261).
+# Breaking for consumers: public core types now come from the 0.2 line.
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -29,20 +31,16 @@ keywords = ["ikigai", "roc", "lisp", "scheme", "capability"]
 categories = ["compilers", "caching"]
 
 [dependencies]
-# The released kernel, consumed from crates.io — the SAME version the hosts use,
-# so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
-# 0.1.50 carries `Invocation::scope_sync` + `SyncIssuer` — the sync-eval bridge
-# this crate proved privately, now consumed from core. 0.1.89 is the true minimum:
-# `space_iri` names `space()` (ledger #987), and `bind` drops a name, so a host that
-# extends this space does not carry `urn:iki:space:lisp` over different doors.
-ikigai-core = "0.1.89"
+# 0.2.0 is the streams release (ledger #2261). The old 0.1 pin meant <0.2.0
+# under 0.x rules. This caret floor admits 0.2.x so hosts share one core.
+ikigai-core = "0.2.0"
 async-trait = "0.1"
 # The neutral s-expression foundation — owns the pure `sexpr_to_sparql` (query) and
 # `sexpr_to_turtle` (graph) compilers over its language-agnostic `Sexpr` datum (single
 # source of truth). The `(sparql-select …)` and `(graph …)` builtins adapt Steel's
 # `SteelVal` into `Sexpr` and call these, rather than carrying an inline compiler.
-# 0.1.1 introduced `sexpr_to_turtle`; pin 0.1.2 (the current published line).
-ikigai-sexpr = "0.1.2"
+# 0.3.0 moves the compilers onto the streams core 0.2 line.
+ikigai-sexpr = "0.3.0"
 # The Scheme engine; its builtins are the kernel verbs. 0.8 is the current
 # embedding API (`Engine::run`, `register_fn`).
 # PINNED EXACTLY (ledger #921): the sandbox's allowlist is DERIVED from Steel's compiled
@@ -58,52 +56,21 @@ steel-core = "=0.8.3"
 # Test executor (`block_on`, `now_or_never`) only — the sync↔async bridge itself
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
 futures = "0.3"
-# The module recipe as one test (`tests/conformance.rs`): walks every endpoint the
-# fixture kernel binds and reports every violation at once. Dev-only. 0.8.0 adds
-# REQUIRED (ledger #329), VALIDATE (0.7.0) and the fixture-argument DECLARATIONS
-# finding, and pins `ikigai-core ^0.1.100`, which unifies with this crate's caret on
-# the 0.1 line (tests only: the library's own floor stays where its API needs it).
-# 0.8.1 is the true minimum now: `Report::required_probes` and `idle_waivers` (ledger
-# #1493) hold the composed sign doors' typed refusals by their evidence, now that sign's
-# REQUIRED waiver is gone (ledger #1515). 0.9.0 adds core 0.1.105's contract-shape checks
-# (REQUIRED probes input groups, OUTPUTS honors output_from, PIPELINE's named-only line,
-# VALIDATE refuses a default on a binding) and RECOMPUTE; 0.10.0 adds FAILURES (off unless a
-# suite opts in). A 0.x caret is a CEILING too: `"0.10.0"` is `<0.11.0`.
-ikigai-conformance = "0.10.0"
-# The real signing module, so urn:lisp:run's verify goes THROUGH the kernel to a
-# genuine urn:sign:verify (module composition, not a stub). Dev-only.
-# Sign 0.3.1 types a missing required input as `MissingArgument` (0.3.2 also types an
-# unparseable key IRI as `InvalidArgument`), so the conformance walk's REQUIRED holds the
-# composed sign doors with no waiver (ledger #1515); 0.3.2 is the current line.
-# A 0.x caret is a CEILING too: the old `"0.2.0"` (`<0.3.0`) kept this on sign 0.2.x.
-ikigai-sign = "0.3.2"
-
-# The wall-clock Timeout overlay — proves the wire-eval L1 governor end to end:
-# the async servicing loop yields, so the racing timer actually fires mid-eval.
-ikigai-throttle = "0.1.6"
-# A real sibling module, so the `(source "urn:iki:fn:toUpper" …)` oracle proves
-# verb-as-function across a genuine module boundary, not a local stub.
-# 0.2.0 is the true minimum: it moved fn's own names into the `urn:iki:` namespace,
-# and `space()` binds ONLY `urn:iki:fn:*` — no alias, because a module does not set
-# binding policy for its hosts. Test-only, so this pin says nothing to consumers.
-# Pinned to the CURRENT line, not that floor: a 0.x caret is a ceiling too, and
-# `"0.2.0"` (`<0.3.0`) left the oracle running fn 0.2.1 while fn moved to 0.4.0.
-# 0.4.0 names its space `urn:iki:space:fn` (ledger #987); the test kernels extend
-# that space with `bind`, which drops the name (core 0.1.89), so this also proves
-# a host can extend a named sibling space with lisp's doors.
-ikigai-fn = "0.4.0"
-# The real SPARQL engine, so the `(sparql-select …)` oracle runs a compiled query
-# end-to-end through `urn:sparql:select` — dev-dep ONLY (runtime reaches it via the
-# verb path, not a build link). It unifies with lisp's ikigai-core caret (both on the
-# 0.1.x kernel line), so one kernel type is linked across the test. Pinned to the current
-# line: the old `"0.1.5"` was a ceiling (`<0.2.0`) below sparql 0.2.5 (ledger #1515).
-ikigai-sparql = "0.2.5"
-
-# ★ The REPL engine, for `tests/pipeline.rs` (ledger #980). Whether a positional or piped
-# value reaches a door is decided by the engine's routing rule (a Source fills the ONE declared
-# argument left unnamed), not by the kernel, so only the real engine can show it. Dev-only.
-# `^0.1.43` unifies with this crate's ikigai-core caret (the engine asks for `^0.1.87`).
-ikigai-engine = "0.1.43"
+# The module recipe as one test (`tests/conformance.rs`), including the composed
+# signing doors. 0.11.0 enables DATATYPES and FAILURES by default on core 0.2.
+ikigai-conformance = "0.11.0"
+# The real signing module verifies stored programs through the kernel. 0.4.1
+# requires core 0.2.1, admitted by our 0.2.0 caret floor.
+ikigai-sign = "0.4.1"
+# The wall-clock Timeout overlay proves the wire-eval governor end to end.
+ikigai-throttle = "0.3.0"
+# A real sibling proves verb-as-function across a module boundary.
+ikigai-fn = "0.7.0"
+# The real SPARQL engine runs the compiled-query oracle end to end.
+ikigai-sparql = "0.3.1"
+# The real REPL engine proves positional and piped routing (`tests/pipeline.rs`).
+# All these released siblings share core 0.2 with the library.
+ikigai-engine = "0.2.0"
 # The engine reads each contract as `Meta as=application/json`; the test kernel must answer,
 # or the engine fails OPEN and routes every value to `in`, proving nothing.
 serde_json = "1"
