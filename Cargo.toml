@@ -59,8 +59,8 @@ steel-core = "=0.8.3"
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`), including the composed
-# signing doors. 0.11.0 enables DATATYPES and FAILURES by default on core 0.2.
-ikigai-conformance = "0.11.0"
+# signing doors. 0.12.0 also enables BODIES and BODY-INPUTS by default.
+ikigai-conformance = "0.12.0"
 # The real signing module verifies stored programs through the kernel. 0.4.1
 # requires core 0.2.1, admitted by our 0.2.0 caret floor.
 ikigai-sign = "0.4.1"
