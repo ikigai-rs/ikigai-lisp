@@ -61,9 +61,21 @@ uncaught. The pins: the names a program can reach after build EQUAL the allowlis
 test observes every global before and after lock-down), and the derived list equals
 the closure of the program list over THIS Steel's stdlib, so an upgrade that moves
 Steel's internals fails CI saying which way. Anything off the list is refused —
-`display`, `vector-ref`, `string-join`, `when`, `struct` — and adding a pure function or
+`display`, `string-join`, `when`, `struct` — and adding a pure function or
 macro is a one-line change the pins then check. The lists, how they were derived and
 how to regenerate them: `src/sandbox.rs` and `docs/design/sandbox-allowlist.md`.
+
+For data shaping, `(sort (list 3 1 2) <)` returns `(1 2 3)`; the comparator can
+also be a Lisp function, such as `(lambda (a b) (> a b))` for descending order.
+Sorting returns a new list and leaves the input list alone. Comparators execute
+inside the same sandbox as the rest of the program.
+
+`(string-split "a,b,c" ",")` returns `("a" "b" "c")`. This is an alias for
+Steel's `split-many`: the delimiter is a literal string, may contain multiple
+characters, and empty fields are preserved (including trailing ones). An empty
+delimiter splits at Unicode character boundaries, with empty fields at both ends.
+These operations need no host access. For example, a pure composition can opt into
+caching with `(cacheable (sort (map string->number (string-split "3,1,2" ",")) <))`.
 
 ## Performance
 

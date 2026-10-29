@@ -334,6 +334,8 @@ const PRELUDE: &str = r#"
 (define (invoke verb iri . pairs) (%verb-args (symbol->string verb) iri pairs))
 (define (graph g) (%graph g))
 (define (input) (%input))
+;; A literal delimiter splitter, using Steel's pure string primitive.
+(define string-split split-many)
 "#;
 
 /// A `read` that cannot carry one call's leftovers into the next.

@@ -23,6 +23,57 @@ fn eval(src: &str) -> Result<String, Error> {
         .map(|repr| String::from_utf8(repr.bytes).expect("utf-8"))
 }
 
+#[test]
+fn sort_with_a_comparator_is_available() {
+    for (src, expected) in [
+        ("(sort (list 3 1 2) <)", "(1 2 3)"),
+        ("(sort (list 3 1 2 1) (lambda (a b) (> a b)))", "(3 2 1 1)"),
+        ("(sort (list) <)", "()"),
+        ("(sort (list 1) (lambda (a b) (< a b)))", "(1)"),
+        (
+            "(define xs (list 3 1 2)) (list (sort xs <) xs)",
+            "((1 2 3) (3 1 2))",
+        ),
+    ] {
+        assert_eq!(eval(src).unwrap(), expected, "{src}");
+    }
+}
+
+#[test]
+fn string_split_is_available() {
+    for (src, expected) in [
+        (r#"(string-split "a,b,c" ",")"#, r#"("a" "b" "c")"#),
+        (r#"(string-split ",a,," ",")"#, r#"("" "a" "" "")"#),
+        (r#"(string-split "" ",")"#, r#"("")"#),
+        (r#"(string-split "abc" ",")"#, r#"("abc")"#),
+        (r#"(string-split "猫::犬::" "::")"#, r#"("猫" "犬" "")"#),
+        (r#"(string-split "a.b.*c" ".")"#, r#"("a" "b" "*c")"#),
+        (r#"(string-split "猫犬" "")"#, r#"("" "猫" "犬" "")"#),
+        (r#"(split-many "a,b" ",")"#, r#"("a" "b")"#),
+        (
+            r#"(cacheable (sort (map string->number (string-split "3,1,2" ",")) <))"#,
+            "(1 2 3)",
+        ),
+    ] {
+        assert_eq!(eval(src).unwrap(), expected, "{src}");
+    }
+}
+
+#[test]
+fn shaping_functions_propagate_catchable_errors() {
+    for src in [
+        r#"(with-handler (lambda (e) "caught") (string-split 1 ","))"#,
+        r#"(with-handler (lambda (e) "caught") (string-split "abc"))"#,
+        r#"(with-handler (lambda (e) "caught") (sort (list 2 1) (lambda (a b) (error "bad comparison"))))"#,
+    ] {
+        assert_eq!(eval(src).unwrap(), "caught", "{src}");
+    }
+    refused(
+        "(sort (list 2 1) (lambda (a b) (env-var \"HOME\")))",
+        "env-var",
+    );
+}
+
 /// Assert `src` is refused as `Denied`, naming `what`.
 fn refused(src: &str, what: &str) {
     match eval(src) {

@@ -52,7 +52,7 @@ use Name::{In, Top};
 pub(crate) const PRELUDE_NAMES: &[&str] = &[
     // The verbs and their friends (`PRELUDE`).
     "source", "sink", "meta", "exists", "delete", "invoke", "sparql-select", "graph",
-    "input", "cacheable", "cacheable/ttl",
+    "input", "cacheable", "cacheable/ttl", "string-split",
     // The primitives under them (`register_primitives`). `%verb-args` is also called
     // directly by the alias prelude a host generates (`urn:lisp:aliases`).
     "%source", "%source-in", "%sink", "%meta", "%meta-as", "%exists", "%delete", "%input",
@@ -73,10 +73,10 @@ pub(crate) const PROGRAM_NAMES: &[&str] = &[
     "number->string", "string->number",
     // Lists.
     "list", "cons", "car", "cdr", "cadr", "caddr", "cddr", "append", "reverse", "length",
-    "list?", "null?", "map", "filter", "assoc", "vector",
+    "list?", "null?", "map", "filter", "assoc", "vector", "sort",
     // Strings and characters.
     "string?", "string-append", "string-length", "string-upcase", "string-downcase",
-    "substring", "string->list", "list->string", "split-whitespace", "ends-with?",
+    "substring", "string->list", "list->string", "split-whitespace", "split-many", "ends-with?",
     "to-string", "symbol->string", "char->integer", "utf8-length",
     // Equality, truth, data in.
     "equal?", "not", "open-input-string", "eof-object?",
@@ -108,6 +108,19 @@ pub(crate) const STDLIB_INTERNALS: &[Name] = &[
     In("#%private/steel/stdlib", "map"), In("#%private/steel/stdlib", "filter"),
     In("#%private/steel/stdlib", "assoc"), In("#%private/steel/stdlib", "cadr"),
     In("#%private/steel/stdlib", "caddr"), In("#%private/steel/stdlib", "cddr"),
+    // `sort`: native comparators use list-sort; Lisp comparators sort a fresh
+    // mutable vector. These operations carry no host authority.
+    Top("#%function-pointer?"), Top("#%list-sort"),
+    Top("#%prim.current-function-span"), Top("#%prim.error-with-span"),
+    Top("#%prim.function?"), Top("#%prim.list?"), Top("#%prim.void"),
+    Top("for-each"), Top("mutable-vector"), Top("mutable-vector->list"),
+    Top("vector-length"), Top("vector-push!"), Top("vector-ref"),
+    Top("vector-set!"), Top("vector-swap!"),
+    In("#%private/steel/stdlib", "#%for-each"), In("#%private/steel/stdlib", "for-each"),
+    In("#%private/steel/sort", "sort"), In("#%private/steel/sort", "list->mutable-vector"),
+    In("#%private/steel/sort", "quick-1"), In("#%private/steel/sort", "partition"),
+    In("#%private/steel/sort", "ploop"), In("#%private/steel/sort", "uploop"),
+    In("#%private/steel/sort", "downloop"),
     // What the prelude's `read` uses: drain a string port, trim it, say eof or error.
     Top("#%string-input-port?"), Top("read-port-to-string"),
     In("#%private/steel/ports", "read-port-to-string"), Top("trim"), Top("eof-object"),
