@@ -98,8 +98,21 @@ and what the allowed macros expand into. Macros: `and`, `or`, `cond`, `let*`,
 lists above over the reference graph of Steel's compiled stdlib, minus the lists
 themselves: the `#%prim.` primitives the stdlib's definitions call, thread-local storage
 and the continuation machinery behind `with-handler`, the module definitions behind `map`,
-`filter`, `assoc` and the `c…r`s, and what the prelude's `read` uses. 34 entries; nothing
-in it reaches the host.
+`filter`, `assoc` and the `c…r`s, and what the prelude's `read` uses. Sorting adds
+the dependency closure described below; nothing in it reaches the host.
+
+**Data shaping** (ledger #2489): `sort` and `split-many` are program names, and the
+prelude defines `string-split` as an alias for `split-many`. Steel's splitter calls
+Rust's literal `str::split` and creates a list of strings; it has no host access.
+Steel's `sort` dispatches native comparators to `#%list-sort`, which sorts a copied
+list, and Lisp comparators to quicksort on a fresh mutable vector. Its 24 additional
+internal entries are the sort module's helpers, vector operations, `for-each` and
+its error-reporting dependencies. These operate on evaluation-local values and
+do not expose ports, filesystem, process, environment or module access. Comparator
+code has the same sandbox restrictions as any other Lisp function; sorting does
+not grant it authority or automatically make a program cacheable. The closure pin
+checks both comparator paths, and integration tests cover native/Lisp comparators,
+input preservation, literal/Unicode splitting, errors and comparator refusals.
 
 **Lifted functions** are the one class. The compiler lifts a lambda that captures nothing
 into a global named `##__lifted_pure_function<parse counter>`, so the names cannot be
@@ -154,7 +167,7 @@ reproduction's input and asserts the refusal, a typed `Denied`; none reaches the
 ## What changes for a program
 
 Anything outside the lists is refused, including names a REPL user may reach for: output
-(`display`), `vector-ref`, `string-join`, `when`/`unless`, `struct`. Adding a pure function
+(`display`), `string-join`, `when`/`unless`, `struct`. Adding a pure function
 or a macro is a one-line change to a list, and the pins say whether the stdlib needs
 anything more for it. `(read)` with no port is an error that says to read from a string
 port. The ikigai-programs corpus runs unchanged (177 tests).
