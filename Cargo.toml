@@ -19,7 +19,9 @@ name = "ikigai-lisp"
 # program's own error quoting a caught one keeps its words.
 # 0.4.0 (ledger #2353): adopt core 0.2, the streams release (ledger #2261).
 # Breaking for consumers: public core types now come from the 0.2 line.
-version = "0.4.0"
+# 0.4.1 (ledger #2489): `sort` (native or Lisp comparator) and `string-split` in the sandbox;
+# 24 allowlist entries, all evaluation-local, none reaching the host. Additive: a patch.
+version = "0.4.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
