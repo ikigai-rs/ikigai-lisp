@@ -71,8 +71,9 @@ use async_trait::async_trait;
 use futures::executor::block_on;
 use ikigai_conformance::{rdf, Check, Fixture, Report, Suite};
 use ikigai_core::{
-    ArgRef, Capability, Description, Endpoint, Error, Exact, Expiry, Invocation, Iri, Kernel,
-    ReprType, Representation, Request, Result as CoreResult, Thread, Verb,
+    ArgRef, Capability, Description, Endpoint, EndpointSpace, Error, Exact, Expiry, Invocation,
+    Iri, Kernel, MemoryContentStore, ReprType, Representation, Request, Result as CoreResult,
+    Thread, Verb,
 };
 use ikigai_lisp::{CAP_LISP, CAP_LISP_RUN};
 
@@ -164,6 +165,10 @@ impl Endpoint for Static {
 /// The fixture kernel: the three lisp doors, the real signing module they compose
 /// with, the keypair, and the two resources the hand tests reach for.
 fn kernel() -> Kernel {
+    conformance_kernel().0
+}
+
+fn conformance_kernel() -> (Kernel, Arc<EndpointSpace>, Arc<MemoryContentStore>) {
     let space = ikigai_sign::space()
         .bind(Exact::new(EVAL_IRI), ikigai_lisp::eval())
         .bind(Exact::new(RUN_IRI), ikigai_lisp::run_signed([PUBLIC_IRI]))
@@ -215,7 +220,10 @@ fn kernel() -> Kernel {
                 thread: Some(THREADED_STATE),
             },
         );
-    Kernel::new(Arc::new(space))
+    let space = Arc::new(space);
+    let store = Arc::new(MemoryContentStore::new(1024 * 1024));
+    let kernel = Kernel::new(space.clone()).with_content_store(store.clone());
+    (kernel, space, store)
 }
 
 fn request(verb: Verb, iri: &str, args: &[(&str, &str)]) -> Request {
@@ -259,8 +267,10 @@ fn lisp() -> Capability {
 /// signature, and the sign endpoints' own fixtures. No `pure`, no `cacheable` on
 /// any lisp door; the two sign results are held to the cache over this threaded
 /// keystore, as their own suite holds them. No waiver on any door.
-fn suite(graph: &str) -> Suite {
+fn suite(graph: &str, space: Arc<EndpointSpace>, store: Arc<MemoryContentStore>) -> Suite {
     Suite::new()
+        .body_space(space)
+        .body_input_store(store)
         .namespace(ikigai_sign::SIG_NS)
         .fixture(Fixture::new(EVAL, Verb::Source).arg("in", PROGRAM))
         .fixture(
@@ -287,7 +297,7 @@ fn suite(graph: &str) -> Suite {
 
 /// The walk saw the four lisp endpoints, the two sign endpoints and the four
 /// fixture resources — one Source action each — with every check running, including
-/// DATATYPES and FAILURES (enabled by default since conformance 0.11.0). An endpoint
+/// DATATYPES, FAILURES, BODIES and BODY-INPUTS. An endpoint
 /// bound without a line here would be held to a weaker standard; a declared id
 /// that binds nothing is a stale list.
 fn assert_shape(report: &Report) {
@@ -299,13 +309,29 @@ fn assert_shape(report: &Report) {
     assert_eq!(report.actions, 10, "one Source action each: {report}");
     let skipped: Vec<Check> = report.checks.skipped().collect();
     assert!(skipped.is_empty(), "every check ran: {report}");
+    // Only these deliberately live answers may remain unprobed. In particular,
+    // losing the shared body space or content store must turn this test red.
+    let mut unprobed: Vec<_> = report.unprobed.iter().map(|probe| {
+        assert_eq!(probe.check, Check::Bodies, "{report}");
+        assert_eq!(probe.verb, Verb::Source, "{report}");
+        assert_eq!(probe.reason,
+            "uncacheable, time-varying, or volatile answer: independent calls cannot establish method agreement (Suite::live, expiry or CACHEABLE's byte comparison)",
+            "{report}");
+        probe.endpoint.as_str()
+    }).collect();
+    unprobed.sort_unstable();
+    assert_eq!(
+        unprobed,
+        [ECHO, EVAL, RUN, "vault", VAULT_READER],
+        "{report}"
+    );
 }
 
 #[test]
 fn conforms() {
-    let kernel = kernel();
+    let (kernel, space, store) = conformance_kernel();
     let graph = sign(&kernel, PROGRAM);
-    let report = suite(&graph).run_blocking(&kernel);
+    let report = suite(&graph, space, store).run_blocking(&kernel);
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
@@ -323,9 +349,9 @@ fn conforms() {
 /// old waiver covered while sign typed them as `Error::Endpoint` (through sign 0.3.0).
 #[test]
 fn the_composed_sign_doors_refuse_a_missing_input_typed() {
-    let kernel = kernel();
+    let (kernel, space, store) = conformance_kernel();
     let graph = sign(&kernel, PROGRAM);
-    let report = suite(&graph).run_blocking(&kernel);
+    let report = suite(&graph, space, store).run_blocking(&kernel);
     assert!(report.idle_waivers().is_empty(), "{report}");
     let mut got: Vec<(&str, &str, Option<&str>)> = report
         .required_probes()
@@ -354,7 +380,7 @@ fn the_composed_sign_doors_refuse_a_missing_input_typed() {
 /// The cacheability decision, in the code's own terms and then in the suite's.
 #[test]
 fn an_eval_is_live_until_its_program_says_otherwise() {
-    let kernel = kernel();
+    let (kernel, space, store) = conformance_kernel();
     let cap = lisp();
 
     // Touches nothing, opts into nothing: uncacheable by design, never stored.
@@ -410,7 +436,9 @@ fn an_eval_is_live_until_its_program_says_otherwise() {
     // contradict: `cacheable("eval")` over the fixture program costs exactly one
     // finding — CACHEABLE on eval's Source — and nothing else changes.
     let graph = sign(&kernel, PROGRAM);
-    let report = suite(&graph).cacheable(EVAL).run_blocking(&kernel);
+    let report = suite(&graph, space, store)
+        .cacheable(EVAL)
+        .run_blocking(&kernel);
     eprintln!("[declared cacheable, to show the red line]\n{report}");
     assert_eq!(
         report.findings.len(),
