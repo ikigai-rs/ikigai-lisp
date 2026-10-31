@@ -436,8 +436,8 @@ pub const SPACE_ID: &str = "urn:iki:space:lisp";
 /// every verb the program reaches.
 ///
 /// The space names itself [`SPACE_ID`]: it is configuration-free, because nothing is
-/// read while building it. The [`Limits`] and steel's home are read when an eval
-/// runs, not here. Binding another door onto it drops the name (core 0.1.89).
+/// read while building it. The [`Limits`] are read when an eval runs, not here.
+/// Binding another door onto it drops the name (core 0.1.89).
 pub fn space() -> EndpointSpace {
     EndpointSpace::new()
         .bind(Exact::new("urn:lisp:eval"), eval())
@@ -1362,16 +1362,9 @@ fn build_engine() -> Engine {
 /// primitives registered and the prelude run. Never handed a program; the sandbox's tests
 /// read its stdlib from here.
 ///
-/// Nothing here creates Steel's home directory (`$STEEL_HOME`, else `~/.steel`, else
-/// `$XDG_DATA_HOME/steel`). Up to 0.3.0 this crate created it, because `steel-core` creates
-/// it with `create_dir`, not `create_dir_all`, and on a fresh service user that fails and
-/// prints to stderr. Nothing a program can do reads it: it holds `cogs/` for path `require`
-/// (refused by [`sandbox::screen`] and [`sandbox::lock_down`]'s resolver), `native/` for
-/// dylibs (blocked by `new_sandboxed`) and `cached-modules/`, which `steel-core` 0.8.3 never
-/// reads or writes (`CompiledModuleCache::cache_module` and `cached_mut` have no callers).
-/// Steel still needs the home PATH — every engine build unwraps it — but not the directory,
-/// so the cost of not creating it is that one stderr line, once per process, on an account
-/// whose `~/.local/share` does not exist (ledger #921).
+/// Steel's embedded feature disables home discovery and disk module caches, including
+/// their directory creation, in the pinned engine source (see `vendor/steel-core`).
+/// Building an engine needs neither a home directory nor process environment changes.
 fn build_unlocked_engine() -> Engine {
     let mut engine = Engine::new_sandboxed();
     register_primitives(&mut engine);

@@ -53,7 +53,9 @@ ikigai-sexpr = "0.3.0"
 # `=` means every Steel this runs on was checked by CI; a Steel upgrade is a release of
 # this crate, with the allowlist re-derived. No other ikigai crate depends on steel-core,
 # so the exact pin cannot split a consumer's graph.
-steel-core = "=0.8.3"
+# The embedded feature is a local patch to that exact source: no home discovery
+# or disk cache. See vendor/steel-core/README.ikigai.md.
+steel-core = { version = "=0.8.3", path = "vendor/steel-core", features = ["embedded"] }
 [dev-dependencies]
 # Test executor (`block_on`, `now_or_never`) only — the sync↔async bridge itself
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
@@ -62,8 +64,9 @@ futures = "0.3"
 # signing doors. 0.12.0 also enables BODIES and BODY-INPUTS by default.
 ikigai-conformance = "0.12.0"
 # The real signing module verifies stored programs through the kernel. 0.4.1
-# requires core 0.2.1, admitted by our 0.2.0 caret floor.
-ikigai-sign = "0.4.1"
+# requires core 0.2.1, admitted by our 0.2.0 caret floor. Pin this fixture:
+# 0.4.2 refuses one-shot Ed25519 bodies, which this conformance fixture supplies.
+ikigai-sign = "=0.4.1"
 # The wall-clock Timeout overlay proves the wire-eval governor end to end.
 ikigai-throttle = "0.3.0"
 # A real sibling proves verb-as-function across a module boundary.
@@ -83,3 +86,7 @@ serde_json = "1"
 # debug build. A profile applies only to this workspace's own builds, never a consumer's.
 [profile.dev.package.steel-core]
 opt-level = 3
+
+# Keep the upstream engine source outside our workspace lint/test targets.
+[workspace]
+exclude = ["vendor/steel-core"]

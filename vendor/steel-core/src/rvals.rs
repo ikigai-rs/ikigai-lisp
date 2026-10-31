@@ -1,0 +1,3101 @@
+pub mod cycles;
+
+use crate::{
+    compiler::{constants::ConstantMap, map::SymbolMap, modules::ModuleManager},
+    gc::{
+        shared::{
+            MappedScopedReadContainer, MappedScopedWriteContainer, ScopedReadContainer,
+            ScopedWriteContainer, ShareableMut, StandardShared,
+        },
+        unsafe_erased_pointers::{OpaqueReference, TemporaryMutableView, TemporaryReadonlyView},
+        Gc, GcMut,
+    },
+    parser::{
+        ast::{self, Atom, ExprKind},
+        parser::SyntaxObject,
+        span::Span,
+        tokens::TokenType,
+    },
+    primitives::numbers::realp,
+    rerrs::{ErrorKind, SteelErr},
+    steel_vm::{
+        engine::ModuleContainer,
+        vm::{
+            threads::closure_into_serializable, BuiltInSignature, Continuation, ContinuationMark,
+            SteelThread,
+        },
+    },
+    values::{
+        closed::{HeapRef, MarkAndSweepContext},
+        functions::{BoxedDynFunction, ByteCodeLambda},
+        lazy_stream::{LazyStream, SerializableStream},
+        lists::Pair,
+        port::{SendablePort, SteelPort},
+        serde::call_deserializer_by_name,
+        structs::{
+            create_struct_spec, fetch_from_type_map, SerializableUserDefinedStruct,
+            StructConstructorRefSpec, StructTypeDescriptor, UserDefinedStruct,
+        },
+        transducers::{Reducer, Transducer},
+        HashMapConsumingIter, HashSetConsumingIter, SteelPortRepr, VectorConsumingIter,
+    },
+};
+use alloc::vec::IntoIter;
+use serde::{Deserialize, Serialize};
+use std::{
+    any::{Any, TypeId},
+    cell::RefCell,
+    cmp::Ordering,
+    convert::TryInto,
+    fmt,
+    future::Future,
+    hash::{Hash, Hasher},
+    io::Write,
+    ops::Deref,
+    pin::Pin,
+    rc::Rc,
+    result,
+    sync::{Arc, Mutex},
+    task::Context,
+};
+use thin_vec::ThinVec;
+
+// TODO
+#[macro_export]
+macro_rules! list {
+    () => { $crate::rvals::SteelVal::ListV(
+        im_lists::list![]
+    ) };
+
+    ( $($x:expr),* ) => {{
+        $crate::rvals::SteelVal::ListV(vec![$(
+            $crate::rvals::IntoSteelVal::into_steelval($x).unwrap()
+        ), *].into())
+    }};
+
+    ( $($x:expr ,)* ) => {{
+        $crate::rvals::SteelVal::ListV(im_lists::list![$(
+            $crate::rvals::IntoSteelVal::into_steelval($x).unwrap()
+        )*])
+    }};
+}
+
+use bigdecimal::BigDecimal;
+use parking_lot::RwLock;
+use smallvec::SmallVec;
+use SteelVal::*;
+
+use crate::values::{HashMap, HashSet, Vector};
+
+use futures_task::noop_waker_ref;
+use futures_util::future::Shared;
+use futures_util::FutureExt;
+
+use crate::values::lists::List;
+use num_bigint::{BigInt, ToBigInt};
+use num_rational::{BigRational, Rational32};
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
+use steel_parser::tokens::{IntLiteral, RealLiteral};
+
+use self::cycles::{CycleDetector, IterativeDropHandler};
+
+pub type RcRefSteelVal = Rc<RefCell<SteelVal>>;
+pub fn new_rc_ref_cell(x: SteelVal) -> RcRefSteelVal {
+    Rc::new(RefCell::new(x))
+}
+
+pub type Result<T> = result::Result<T, SteelErr>;
+pub type FunctionSignature = fn(&[SteelVal]) -> Result<SteelVal>;
+pub type MutFunctionSignature = fn(&mut [SteelVal]) -> Result<SteelVal>;
+
+#[cfg(not(feature = "sync"))]
+pub type BoxedAsyncFunctionSignature =
+    crate::gc::Shared<Box<dyn Fn(&[SteelVal]) -> Result<FutureResult>>>;
+
+#[cfg(feature = "sync")]
+pub type BoxedAsyncFunctionSignature =
+    crate::gc::Shared<Box<dyn Fn(&[SteelVal]) -> Result<FutureResult> + Send + Sync + 'static>>;
+
+pub type AsyncSignature = fn(&[SteelVal]) -> FutureResult;
+
+#[cfg(not(feature = "sync"))]
+pub type BoxedFutureResult = Pin<Box<dyn Future<Output = Result<SteelVal>>>>;
+
+#[cfg(feature = "sync")]
+pub type BoxedFutureResult = Pin<Box<dyn Future<Output = Result<SteelVal>> + Send + 'static>>;
+
+// TODO: Why can't I put sync here?
+// #[cfg(feature = "sync")]
+// pub type BoxedFutureResult = Pin<Box<dyn Future<Output = Result<SteelVal>> + Send + 'static>>;
+
+#[derive(Clone)]
+pub struct FutureResult(Shared<BoxedFutureResult>);
+
+impl FutureResult {
+    pub fn new(fut: BoxedFutureResult) -> Self {
+        FutureResult(fut.shared())
+    }
+
+    pub fn into_shared(self) -> Shared<BoxedFutureResult> {
+        self.0
+    }
+}
+
+// This is an attempt to one off poll a future
+// This should enable us to use embedded async functions
+// Will require using call/cc w/ a thread queue in steel, however it should be possible
+pub(crate) fn poll_future(mut fut: Shared<BoxedFutureResult>) -> Option<Result<SteelVal>> {
+    // If the future has already been awaited (by somebody) get that value instead
+    if let Some(output) = fut.peek() {
+        return Some(output.clone());
+    }
+
+    // Otherwise, go ahead and poll the value to see if its ready
+    // The context is going to exist exclusively in Steel, hidden behind an `await`
+    let waker = noop_waker_ref();
+    let context = &mut Context::from_waker(waker);
+
+    // Polling requires a pinned future - TODO make sure this is correct
+    let mut_fut = Pin::new(&mut fut);
+
+    match Future::poll(mut_fut, context) {
+        core::task::Poll::Ready(r) => Some(r),
+        core::task::Poll::Pending => None,
+    }
+}
+
+/// Attempt to cast this custom type down to the underlying type
+pub fn as_underlying_type<T: 'static>(value: &dyn CustomType) -> Option<&T> {
+    value.as_any_ref().downcast_ref::<T>()
+}
+
+pub fn as_underlying_type_mut<T: 'static>(value: &mut dyn CustomType) -> Option<&mut T> {
+    value.as_any_ref_mut().downcast_mut::<T>()
+}
+
+pub trait Custom: private::Sealed {
+    fn fmt(&self) -> Option<core::result::Result<String, core::fmt::Error>> {
+        None
+    }
+
+    #[cfg(feature = "dylibs")]
+    fn fmt_ffi(&self) -> Option<abi_stable::std_types::RString> {
+        None
+    }
+
+    fn into_serializable_steelval(&mut self) -> Option<SerializableSteelVal> {
+        None
+    }
+
+    fn as_iterator(&self) -> Option<Box<dyn Iterator<Item = SteelVal>>> {
+        None
+    }
+
+    fn gc_drop_mut(&mut self, _drop_handler: &mut IterativeDropHandler) {}
+
+    fn gc_visit_children(&self, _context: &mut MarkAndSweepContext) {}
+
+    fn visit_equality(&self, _visitor: &mut cycles::EqualityVisitor) {}
+
+    fn equality_hint(&self, _other: &dyn CustomType) -> bool {
+        true
+    }
+
+    fn equality_hint_general(&self, _other: &SteelVal) -> bool {
+        false
+    }
+
+    #[cfg(feature = "custom-hash")]
+    fn try_as_dyn_hash(&self) -> Option<&dyn DynHash> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn into_error(self) -> core::result::Result<SteelErr, Self>
+    where
+        Self: Sized,
+    {
+        Err(self)
+    }
+}
+
+#[cfg(not(feature = "sync"))]
+pub trait MaybeSendSyncStatic: 'static {}
+
+#[cfg(not(feature = "sync"))]
+impl<T: 'static> MaybeSendSyncStatic for T {}
+
+#[cfg(feature = "sync")]
+pub trait MaybeSendSyncStatic: Send + Sync + 'static {}
+
+#[cfg(feature = "sync")]
+impl<T: Send + Sync + 'static> MaybeSendSyncStatic for T {}
+
+/// Dyn compatible version of [Hash]
+#[cfg(feature = "custom-hash")]
+pub trait DynHash {
+    fn dyn_hash(&self, h: &mut dyn ::core::hash::Hasher);
+}
+
+#[cfg(feature = "custom-hash")]
+impl<T: ::core::hash::Hash> DynHash for T {
+    fn dyn_hash(&self, h: &mut dyn ::core::hash::Hasher) {
+        self.hash(&mut Box::new(h))
+    }
+}
+
+#[cfg(feature = "sync")]
+pub trait CustomType: MaybeSendSyncStatic {
+    fn as_any_ref(&self) -> &dyn Any;
+    fn as_any_ref_mut(&mut self) -> &mut dyn Any;
+    fn name(&self) -> &str {
+        core::any::type_name::<Self>()
+    }
+    fn inner_type_id(&self) -> TypeId;
+    fn display(&self) -> core::result::Result<String, core::fmt::Error> {
+        Ok(format!("#<{}>", self.name()))
+    }
+    fn as_serializable_steelval(&mut self) -> Option<SerializableSteelVal> {
+        None
+    }
+
+    fn as_serializable_steelval_with_ctx(
+        &mut self,
+        ctx: &mut SerializationContext,
+    ) -> Option<Result<SerializableSteelVal>> {
+        use crate::values::serde::call_serializer;
+        call_serializer::<Self>(ctx, &self).map(|x| {
+            x.map(|x| {
+                SerializableSteelVal::NativeStruct(core::any::type_name::<Self>().to_string(), x)
+            })
+        })
+    }
+
+    fn drop_mut(&mut self, _drop_handler: &mut IterativeDropHandler) {}
+    fn visit_children(&self, _context: &mut MarkAndSweepContext) {}
+    // TODO: Add this back at some point
+    // fn visit_children_ref_queue(&self, _context: &mut MarkAndSweepContextRefQueue) {}
+    fn visit_children_for_equality(&self, _visitor: &mut cycles::EqualityVisitor) {}
+    fn check_equality_hint(&self, _other: &dyn CustomType) -> bool {
+        true
+    }
+    fn check_equality_hint_general(&self, _other: &SteelVal) -> bool {
+        false
+    }
+
+    #[cfg(feature = "custom-hash")]
+    fn try_as_dyn_hash(&self) -> Option<&dyn DynHash> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn into_error_(self) -> core::result::Result<SteelErr, Self>
+    where
+        Self: Sized,
+    {
+        Err(self)
+    }
+}
+
+#[cfg(not(feature = "sync"))]
+pub trait CustomType {
+    fn as_any_ref(&self) -> &dyn Any;
+    fn as_any_ref_mut(&mut self) -> &mut dyn Any;
+    fn name(&self) -> &str {
+        core::any::type_name::<Self>()
+    }
+    fn inner_type_id(&self) -> TypeId;
+    fn display(&self) -> core::result::Result<String, core::fmt::Error> {
+        Ok(format!("#<{}>", self.name()))
+    }
+    fn as_serializable_steelval(&mut self) -> Option<SerializableSteelVal> {
+        None
+    }
+
+    fn as_serializable_steelval_with_ctx(
+        &mut self,
+        ctx: &mut SerializationContext,
+    ) -> Option<Result<SerializableSteelVal>>
+    where
+        Self: 'static,
+    {
+        use crate::values::serde::call_serializer;
+        call_serializer::<Self>(ctx, &self).map(|x| {
+            x.map(|x| {
+                SerializableSteelVal::NativeStruct(core::any::type_name::<Self>().to_string(), x)
+            })
+        })
+    }
+
+    fn drop_mut(&mut self, _drop_handler: &mut IterativeDropHandler) {}
+    fn visit_children(&self, _context: &mut MarkAndSweepContext) {}
+    fn visit_children_for_equality(&self, _visitor: &mut cycles::EqualityVisitor) {}
+    fn check_equality_hint(&self, _other: &dyn CustomType) -> bool {
+        true
+    }
+    fn check_equality_hint_general(&self, _other: &SteelVal) -> bool {
+        false
+    }
+
+    #[cfg(feature = "custom-hash")]
+    fn try_as_dyn_hash(&self) -> Option<&dyn DynHash> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn into_error_(self) -> core::result::Result<SteelErr, Self>
+    where
+        Self: Sized,
+    {
+        Err(self)
+    }
+}
+
+impl<T: Custom + MaybeSendSyncStatic> CustomType for T {
+    fn as_any_ref(&self) -> &dyn Any {
+        self as &dyn Any
+    }
+    fn as_any_ref_mut(&mut self) -> &mut dyn Any {
+        self as &mut dyn Any
+    }
+    fn inner_type_id(&self) -> TypeId {
+        core::any::TypeId::of::<Self>()
+    }
+    fn display(&self) -> core::result::Result<String, core::fmt::Error> {
+        if let Some(formatted) = self.fmt() {
+            formatted
+        } else {
+            Ok(format!("#<{}>", self.name()))
+        }
+    }
+
+    fn as_serializable_steelval(&mut self) -> Option<SerializableSteelVal> {
+        <T as Custom>::into_serializable_steelval(self)
+    }
+
+    fn drop_mut(&mut self, drop_handler: &mut IterativeDropHandler) {
+        self.gc_drop_mut(drop_handler)
+    }
+
+    fn visit_children(&self, context: &mut MarkAndSweepContext) {
+        self.gc_visit_children(context)
+    }
+
+    // TODO: Equality visitor
+    fn visit_children_for_equality(&self, visitor: &mut cycles::EqualityVisitor) {
+        self.visit_equality(visitor)
+    }
+
+    fn check_equality_hint(&self, other: &dyn CustomType) -> bool {
+        self.equality_hint(other)
+    }
+
+    fn check_equality_hint_general(&self, other: &SteelVal) -> bool {
+        self.equality_hint_general(other)
+    }
+
+    fn into_error_(self) -> core::result::Result<SteelErr, Self>
+    where
+        Self: Sized,
+    {
+        self.into_error()
+    }
+
+    #[cfg(feature = "custom-hash")]
+    fn try_as_dyn_hash(&self) -> Option<&dyn DynHash> {
+        Custom::try_as_dyn_hash(self)
+    }
+}
+
+impl<T: CustomType + 'static> IntoSteelVal for T {
+    fn into_steelval(self) -> Result<SteelVal> {
+        Ok(SteelVal::Custom(Gc::new_mut(Box::new(self))))
+    }
+
+    fn as_error(self) -> core::result::Result<SteelErr, Self> {
+        T::into_error_(self)
+    }
+}
+
+pub trait IntoSerializableSteelVal {
+    fn into_serializable_steelval(val: &SteelVal) -> Result<SerializableSteelVal>;
+}
+
+impl<T: CustomType + Clone + Send + Sync + 'static> IntoSerializableSteelVal for T {
+    fn into_serializable_steelval(val: &SteelVal) -> Result<SerializableSteelVal> {
+        if let SteelVal::Custom(v) = val {
+            let left = v.read().as_any_ref().downcast_ref::<T>().cloned();
+            let _lifted = left.ok_or_else(|| {
+                let error_message = format!(
+                    "Type Mismatch: Type of SteelVal: {:?}, did not match the given type: {}",
+                    val,
+                    core::any::type_name::<Self>()
+                );
+                SteelErr::new(ErrorKind::ConversionError, error_message)
+            });
+
+            todo!()
+        } else {
+            let error_message = format!(
+                "Type Mismatch: Type of SteelVal: {:?} did not match the given type, expecting opaque struct: {}",
+                val,
+                core::any::type_name::<Self>()
+            );
+
+            Err(SteelErr::new(ErrorKind::ConversionError, error_message))
+        }
+    }
+}
+
+// TODO: Marshalling out of the type could also try to yoink from a native steel struct.
+// If possible, we can try to line the constructor up with the fields
+impl<T: CustomType + Clone + 'static> FromSteelVal for T {
+    fn from_steelval(val: &SteelVal) -> Result<Self> {
+        if let SteelVal::Custom(v) = val {
+            // let left_type = v.borrow().as_any_ref();
+            // TODO: @Matt - dylibs cause issues here, as the underlying type ids are different
+            // across workspaces and builds
+            let left = v.read().as_any_ref().downcast_ref::<T>().cloned();
+            left.ok_or_else(|| {
+                let error_message = format!(
+                    "Type Mismatch: Type of SteelVal: {:?}, did not match the given type: {}",
+                    val,
+                    core::any::type_name::<Self>()
+                );
+                SteelErr::new(ErrorKind::ConversionError, error_message)
+            })
+        } else {
+            let error_message = format!(
+                "Type Mismatch: Type of SteelVal: {:?} did not match the given type, expecting opaque struct: {}",
+                val,
+                core::any::type_name::<Self>()
+            );
+
+            Err(SteelErr::new(ErrorKind::ConversionError, error_message))
+        }
+    }
+}
+
+/// The entry point for turning values into SteelVals
+/// The is implemented for most primitives and collections
+/// You can also manually implement this for any type, or can optionally
+/// get this implementation for a custom struct by using the custom
+/// steel derive.
+pub trait IntoSteelVal: Sized {
+    fn into_steelval(self) -> Result<SteelVal>;
+
+    #[doc(hidden)]
+    fn as_error(self) -> core::result::Result<SteelErr, Self> {
+        Err(self)
+    }
+}
+
+/// The exit point for turning SteelVals into outside world values
+/// This is implement for most primitives and collections
+/// You can also manually implement this for any type, or can optionally
+/// get this implementation for a custom struct by using the custom
+/// steel derive.
+pub trait FromSteelVal: Sized {
+    fn from_steelval(val: &SteelVal) -> Result<Self>;
+}
+
+pub trait PrimitiveAsRef<'a>: Sized {
+    fn primitive_as_ref(val: &'a SteelVal) -> Result<Self>;
+    fn maybe_primitive_as_ref(val: &'a SteelVal) -> Option<Self>;
+}
+
+pub trait PrimitiveAsRefMut<'a>: Sized {
+    fn primitive_as_ref(val: &'a mut SteelVal) -> Result<Self>;
+    fn maybe_primitive_as_ref(val: &'a mut SteelVal) -> Option<Self>;
+}
+
+pub struct RestArgsIter<'a, T>(
+    pub core::iter::Map<core::slice::Iter<'a, SteelVal>, fn(&'a SteelVal) -> Result<T>>,
+);
+
+impl<'a, T: PrimitiveAsRef<'a> + 'a> RestArgsIter<'a, T> {
+    pub fn new(
+        args: core::iter::Map<core::slice::Iter<'a, SteelVal>, fn(&'a SteelVal) -> Result<T>>,
+    ) -> Self {
+        RestArgsIter(args)
+    }
+
+    pub fn from_slice(args: &'a [SteelVal]) -> Result<Self> {
+        Ok(RestArgsIter(args.iter().map(T::primitive_as_ref)))
+    }
+}
+
+impl<'a, T> Iterator for RestArgsIter<'a, T> {
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<'a, T> ExactSizeIterator for RestArgsIter<'a, T> {}
+
+pub struct RestArgs<T: FromSteelVal>(pub Vec<T>);
+
+impl<T: FromSteelVal> RestArgs<T> {
+    pub fn new(args: Vec<T>) -> Self {
+        RestArgs(args)
+    }
+
+    pub fn from_slice(args: &[SteelVal]) -> Result<Self> {
+        args.iter()
+            .map(|x| T::from_steelval(x))
+            .collect::<Result<Vec<_>>>()
+            .map(RestArgs)
+    }
+}
+
+impl<T: FromSteelVal> core::ops::Deref for RestArgs<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+mod private {
+
+    use core::any::Any;
+
+    pub trait Sealed {}
+
+    impl<T: Any> Sealed for T {}
+}
+
+pub enum SRef<'b, T: ?Sized + 'b> {
+    Temporary(&'b T),
+    Owned(MappedScopedReadContainer<'b, T>),
+}
+
+impl<'b, T: ?Sized + 'b> Deref for SRef<'b, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            SRef::Temporary(inner) => inner,
+            SRef::Owned(inner) => inner,
+        }
+    }
+}
+
+// Can you take a steel val and execute operations on it by reference
+pub trait AsRefSteelVal: Sized {
+    type Nursery: Default;
+
+    fn as_ref<'b, 'a: 'b>(val: &'a SteelVal) -> Result<SRef<'b, Self>>;
+}
+
+pub trait AsSlice<T> {
+    fn as_slice_repr(&self) -> &[T];
+}
+
+impl<T> AsSlice<T> for Vec<T> {
+    fn as_slice_repr(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+// TODO: Try to incorporate these all into one trait if possible
+pub trait AsRefSteelValFromUnsized<T>: Sized {
+    type Output: AsSlice<T>;
+
+    fn as_ref_from_unsized(val: &SteelVal) -> Result<Self::Output>;
+}
+
+pub trait AsRefMutSteelVal: Sized {
+    fn as_mut_ref<'b, 'a: 'b>(val: &'a SteelVal) -> Result<MappedScopedWriteContainer<'b, Self>>;
+}
+
+pub(crate) trait AsRefMutSteelValFromRef: Sized {
+    fn as_mut_ref_from_ref(val: &SteelVal) -> crate::rvals::Result<TemporaryMutableView<Self>>;
+}
+
+pub(crate) trait AsRefSteelValFromRef: Sized {
+    fn as_ref_from_ref(val: &SteelVal) -> crate::rvals::Result<TemporaryReadonlyView<Self>>;
+}
+
+impl AsRefSteelVal for UserDefinedStruct {
+    type Nursery = ();
+
+    fn as_ref<'b, 'a: 'b>(val: &'a SteelVal) -> Result<SRef<'b, Self>> {
+        if let SteelVal::CustomStruct(l) = val {
+            Ok(SRef::Temporary(l))
+        } else {
+            stop!(TypeMismatch => "Value cannot be referenced as a list")
+        }
+    }
+}
+
+impl<T: CustomType + MaybeSendSyncStatic> AsRefSteelVal for T {
+    type Nursery = ();
+
+    fn as_ref<'b, 'a: 'b>(val: &'a SteelVal) -> Result<SRef<'b, Self>> {
+        if let SteelVal::Custom(v) = val {
+            let res = ScopedReadContainer::map(v.read(), |x| x.as_any_ref());
+
+            if res.is::<T>() {
+                Ok(SRef::Owned(MappedScopedReadContainer::map(res, |x| {
+                    x.downcast_ref::<T>().unwrap()
+                })))
+            } else {
+                let error_message = format!(
+                    "Type Mismatch: Type of SteelVal: {} did not match the given type: {}",
+                    val,
+                    core::any::type_name::<Self>()
+                );
+                Err(SteelErr::new(ErrorKind::ConversionError, error_message))
+            }
+            // res
+        } else {
+            let error_message = format!(
+                "Type Mismatch: Type of SteelVal: {} did not match the given type: {}",
+                val,
+                core::any::type_name::<Self>()
+            );
+
+            Err(SteelErr::new(ErrorKind::ConversionError, error_message))
+        }
+    }
+}
+
+impl<T: CustomType + MaybeSendSyncStatic> AsRefMutSteelVal for T {
+    fn as_mut_ref<'b, 'a: 'b>(val: &'a SteelVal) -> Result<MappedScopedWriteContainer<'b, Self>> {
+        if let SteelVal::Custom(v) = val {
+            let res = ScopedWriteContainer::map(v.write(), |x| x.as_any_ref_mut());
+
+            if res.is::<T>() {
+                Ok(MappedScopedWriteContainer::map(res, |x| {
+                    x.downcast_mut::<T>().unwrap()
+                }))
+            } else {
+                let error_message = format!(
+                    "Type Mismatch: Type of SteelVal: {} did not match the given type: {}",
+                    val,
+                    core::any::type_name::<Self>()
+                );
+                Err(SteelErr::new(ErrorKind::ConversionError, error_message))
+            }
+            // res
+        } else {
+            let error_message = format!(
+                "Type Mismatch: Type of SteelVal: {} did not match the given type: {}",
+                val,
+                core::any::type_name::<Self>()
+            );
+
+            Err(SteelErr::new(ErrorKind::ConversionError, error_message))
+        }
+    }
+}
+
+impl ast::TryFromSteelValVisitorForExprKind {
+    pub fn visit_syntax_object(&mut self, value: &Syntax) -> Result<ExprKind> {
+        let span = value.span;
+
+        // dbg!(&span);
+        // let source = self.source.clone();
+        match &value.syntax {
+            // Mutual recursion case
+            SyntaxObject(s) => self.visit_syntax_object(s),
+            BoolV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::BooleanLiteral(*x),
+                span,
+            )))),
+            NumV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                RealLiteral::Float((*x).into()).into(),
+                span,
+            )))),
+            IntV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                RealLiteral::Int(IntLiteral::Small(*x)).into(),
+                span,
+            )))),
+            VectorV(lst) => {
+                let items: Result<ThinVec<ExprKind>> = lst.iter().map(|x| self.visit(x)).collect();
+                Ok(ExprKind::List(crate::parser::ast::List::new(items?)))
+            }
+            StringV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::StringLiteral(x.as_str().into()),
+                span,
+            )))),
+
+            SymbolV(x) if x.starts_with("#:") => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::Keyword(x.as_str().into()),
+                span,
+            )))),
+
+            SymbolV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::Identifier(x.as_str().into()),
+                span,
+            )))),
+
+            ListV(l) => {
+                // Rooted - things operate as normal
+                if self.qq_depth == 0 {
+                    let maybe_special_form = l.first().and_then(|x| {
+                        x.as_symbol()
+                            .or_else(|| x.as_syntax_object().and_then(|x| x.syntax.as_symbol()))
+                    });
+
+                    match maybe_special_form {
+                        Some(x) if x.as_str() == "quote" => {
+                            if self.quoted {
+                                let items: core::result::Result<ThinVec<ExprKind>, _> =
+                                    l.iter().map(|x| self.visit(x)).collect();
+
+                                return Ok(ExprKind::List(ast::List::new(items?)));
+                            }
+
+                            self.quoted = true;
+
+                            let return_value = l
+                                .into_iter()
+                                .map(|x| self.visit(x))
+                                .collect::<core::result::Result<ThinVec<_>, _>>()?
+                                .try_into()?;
+
+                            self.quoted = false;
+
+                            return Ok(return_value);
+                        } // "quasiquote" => {
+                        //     self.qq_depth += 1;
+                        // }
+                        // None => {
+                        // return Ok(ExprKind::empty());
+                        // }
+                        _ => {}
+                    }
+                }
+
+                if self.force_hir {
+                    let items: core::result::Result<ThinVec<ExprKind>, _> =
+                        l.iter().map(|x| self.visit(x)).collect();
+
+                    return Ok(ExprKind::List(ast::List::new(items?)));
+                }
+
+                Ok(l.into_iter()
+                    .map(|x| self.visit(x))
+                    .collect::<core::result::Result<ThinVec<_>, _>>()?
+                    .try_into()?)
+            }
+
+            CharV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::CharacterLiteral(*x),
+                span,
+            )))),
+            _ => stop!(ConversionError => "unable to convert {:?} to expression", &value.syntax),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Syntax {
+    pub(crate) raw: Option<SteelVal>,
+    pub(crate) syntax: SteelVal,
+    span: Span,
+}
+
+impl Syntax {
+    pub fn new(syntax: SteelVal, span: Span) -> Syntax {
+        Self {
+            raw: None,
+            syntax,
+            span,
+        }
+    }
+
+    pub fn proto(raw: SteelVal, syntax: SteelVal, span: Span) -> Syntax {
+        Self {
+            raw: Some(raw),
+            syntax,
+            span,
+        }
+    }
+
+    pub fn syntax_e(&self) -> SteelVal {
+        self.syntax.clone()
+    }
+
+    pub fn new_with_source(syntax: SteelVal, span: Span) -> Syntax {
+        Self {
+            raw: None,
+            syntax,
+            span,
+        }
+    }
+
+    pub fn syntax_loc(&self) -> Span {
+        self.span
+    }
+
+    pub fn syntax_datum(&self) -> SteelVal {
+        self.raw.clone().unwrap()
+    }
+
+    pub(crate) fn steelval_to_exprkind(value: &SteelVal) -> Result<ExprKind> {
+        match value {
+            // Mutual recursion case
+            SyntaxObject(s) => s.to_exprkind(),
+            BoolV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::default(
+                TokenType::BooleanLiteral(*x),
+            )))),
+            NumV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::default(
+                RealLiteral::Float((*x).into()).into(),
+            )))),
+            IntV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::default(
+                RealLiteral::Int(IntLiteral::Small(*x)).into(),
+            )))),
+            VectorV(lst) => {
+                let items: Result<ThinVec<ExprKind>> =
+                    lst.iter().map(Self::steelval_to_exprkind).collect();
+                Ok(ExprKind::List(crate::parser::ast::List::new(items?)))
+            }
+            StringV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::default(
+                TokenType::StringLiteral(x.as_str().into()),
+            )))),
+            // LambdaV(_) => Err("Can't convert from Lambda to expression!"),
+            // MacroV(_) => Err("Can't convert from Macro to expression!"),
+            SymbolV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::default(
+                TokenType::Identifier(x.as_str().into()),
+            )))),
+            ListV(l) => {
+                let items: Result<ThinVec<ExprKind>> =
+                    l.iter().map(Self::steelval_to_exprkind).collect();
+
+                Ok(ExprKind::List(crate::parser::ast::List::new(items?)))
+            }
+            CharV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::default(
+                TokenType::CharacterLiteral(*x),
+            )))),
+            _ => stop!(ConversionError => "unable to convert {:?} to expression", value),
+        }
+    }
+
+    // TODO: match on self.syntax. If its itself a syntax object, then just recur on that until we bottom out
+    // Otherwise, reconstruct the ExprKind and replace the span and source information into the representation
+    pub fn to_exprkind(&self) -> Result<ExprKind> {
+        let span = self.span;
+        // let source = self.source.clone();
+        match &self.syntax {
+            // Mutual recursion case
+            SyntaxObject(s) => s.to_exprkind(),
+            BoolV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::BooleanLiteral(*x),
+                span,
+            )))),
+            NumV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                RealLiteral::Float((*x).into()).into(),
+                span,
+            )))),
+            IntV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                RealLiteral::Int(IntLiteral::Small(*x)).into(),
+                span,
+            )))),
+            VectorV(lst) => {
+                let items: Result<ThinVec<ExprKind>> =
+                    lst.iter().map(Self::steelval_to_exprkind).collect();
+                Ok(ExprKind::List(crate::parser::ast::List::new(items?)))
+            }
+            StringV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::StringLiteral(x.as_str().into()),
+                span,
+            )))),
+            // LambdaV(_) => Err("Can't convert from Lambda to expression!"),
+            // MacroV(_) => Err("Can't convert from Macro to expression!"),
+            SymbolV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::Identifier(x.as_str().into()),
+                span,
+            )))),
+            ListV(l) => {
+                let items: Result<ThinVec<ExprKind>> =
+                    l.iter().map(Self::steelval_to_exprkind).collect();
+
+                Ok(ExprKind::List(crate::parser::ast::List::new(items?)))
+            }
+            CharV(x) => Ok(ExprKind::Atom(Atom::new(SyntaxObject::new(
+                TokenType::CharacterLiteral(*x),
+                span,
+            )))),
+            _ => stop!(ConversionError => "unable to convert {:?} to expression", &self.syntax),
+        }
+    }
+}
+
+impl IntoSteelVal for Syntax {
+    fn into_steelval(self) -> Result<SteelVal> {
+        Ok(SteelVal::SyntaxObject(Gc::new(self)))
+    }
+}
+
+impl AsRefSteelVal for Syntax {
+    type Nursery = ();
+
+    fn as_ref<'b, 'a: 'b>(val: &'a SteelVal) -> Result<SRef<'b, Self>> {
+        if let SteelVal::SyntaxObject(s) = val {
+            Ok(SRef::Temporary(s))
+        } else {
+            stop!(TypeMismatch => "Value cannot be referenced as a syntax object: {}", val)
+        }
+    }
+}
+
+impl From<Syntax> for SteelVal {
+    fn from(val: Syntax) -> Self {
+        SteelVal::SyntaxObject(Gc::new(val))
+    }
+}
+
+pub struct SerializedNativeStructSpec {}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum SerializableSteelVal {
+    Closure(crate::values::functions::SerializedLambda),
+    BoolV(bool),
+    NumV(f64),
+    IntV(isize),
+    CharV(char),
+    Void,
+    StringV(String),
+    HashMapV(Vec<(SerializableSteelVal, SerializableSteelVal)>),
+    HashSet(Vec<SerializableSteelVal>),
+    ListV(Vec<SerializableSteelVal>),
+    Pair(Box<(SerializableSteelVal, SerializableSteelVal)>),
+    VectorV(Vec<SerializableSteelVal>),
+    ByteVectorV(Vec<u8>),
+    SymbolV(String),
+    // Genuinely serializable... if possible?
+    // Custom(Box<dyn CustomType + Send>),
+    CustomStruct(SerializableUserDefinedStruct),
+    // Attempt to reuse the storage if possible
+    HeapAllocated(usize),
+    HeapAllocatedVector(usize),
+    // Ports can't really be serialized either?
+    Port(SendablePort),
+    Rational(Rational32),
+    Stream(Box<SerializableStream>),
+    NativeRef(NativeRefSpec),
+    StructConstructorSpec(StructConstructorRefSpec),
+    ModuleSpec(String),
+    GlobalRef(String),
+    BuiltinSteelModuleRef(String, String),
+
+    NativeStruct(String, Vec<u8>),
+}
+
+impl std::fmt::Debug for SerializableSteelVal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SerializableSteelVal::Closure(serialized_lambda) => {
+                write!(f, "{:?}", serialized_lambda)
+            }
+            SerializableSteelVal::BoolV(x) => write!(f, "{}", x),
+            SerializableSteelVal::NumV(x) => write!(f, "{}", x),
+            SerializableSteelVal::IntV(x) => write!(f, "{}", x),
+            SerializableSteelVal::CharV(x) => write!(f, "{}", x),
+            SerializableSteelVal::Void => write!(f, "SteelVal::Void"),
+            SerializableSteelVal::StringV(x) => write!(f, "{}", x),
+            SerializableSteelVal::HashMapV(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::HashSet(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::ListV(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::Pair(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::VectorV(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::ByteVectorV(items) => write!(f, "{:?}", items),
+            SerializableSteelVal::SymbolV(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::CustomStruct(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::HeapAllocated(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::Rational(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::Stream(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::NativeRef(x) => write!(f, "{:?}", x),
+            SerializableSteelVal::StructConstructorSpec(struct_constructor_ref_spec) => {
+                write!(f, "{:?}", struct_constructor_ref_spec)
+            }
+            SerializableSteelVal::ModuleSpec(x) => write!(f, "#<module:{}>", x),
+            SerializableSteelVal::GlobalRef(x) => write!(f, "#<global:{}>", x),
+            SerializableSteelVal::BuiltinSteelModuleRef(m, n) => {
+                write!(f, "#<builtin-module:{}:{}>", m, n)
+            }
+            SerializableSteelVal::Port(sendable_port) => write!(f, "#<port:{:?}>", sendable_port),
+            SerializableSteelVal::NativeStruct(n, _) => write!(f, "#<native:{}>", n),
+            SerializableSteelVal::HeapAllocatedVector(_) => write!(f, "#<mutable-vector>"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct NativeRefSpec {
+    pub module: String,
+    pub key: String,
+    // This should also include some metadata about what the type was _before_
+    // going in, and what it will be after
+    // pub pointer_addr: Option<usize>,
+}
+
+#[derive(Debug)]
+pub enum SerializedHeapRef {
+    Serialized(Option<SerializableSteelVal>),
+    Closed(HeapRef<SteelVal>),
+}
+
+#[derive(Debug)]
+pub enum SerializedHeapRefVector {
+    Serialized(Option<Vec<SerializableSteelVal>>),
+    Closed(HeapRef<Vec<SteelVal>>),
+}
+
+pub struct HeapSerializer<'a> {
+    pub fake_heap: &'a mut std::collections::HashMap<usize, SerializedHeapRef>,
+    pub fake_vector_heap: &'a mut std::collections::HashMap<usize, SerializedHeapRefVector>,
+    // After the conversion, we go back through, and patch the values from the fake heap
+    // in to each of the values listed here - otherwise, we'll miss cycles
+    pub values_to_fill_in: &'a mut std::collections::HashMap<usize, HeapRef<SteelVal>>,
+    pub vectors_to_fill_in: &'a mut std::collections::HashMap<usize, HeapRef<Vec<SteelVal>>>,
+
+    // Cache the functions that get built
+    pub built_functions: &'a mut std::collections::HashMap<u32, Gc<ByteCodeLambda>>,
+
+    pub thread: &'a mut SteelThread,
+
+    pub function_mapping: std::collections::HashMap<u32, u32>,
+
+    pub global_mapping: std::collections::HashMap<usize, usize>,
+
+    pub struct_map: std::collections::HashMap<StructTypeDescriptor, StructTypeDescriptor>,
+}
+
+// Once crossed over the line, convert BACK into a SteelVal
+// This should be infallible.
+pub fn from_serializable_value(
+    ctx: &mut HeapSerializer,
+    val: SerializableSteelVal,
+) -> Result<SteelVal> {
+    match val {
+        SerializableSteelVal::Closure(c) => {
+            if c.captures.is_empty() {
+                if let Some(already_made) = ctx
+                    .function_mapping
+                    .get(&c.id)
+                    .and_then(|x| ctx.built_functions.get(x))
+                {
+                    Ok(SteelVal::Closure(already_made.clone()))
+                } else {
+                    let value = Gc::new(ByteCodeLambda::from_serialized(ctx, c)?);
+                    let id = value.id;
+
+                    // Save those as well
+                    // Probably need to just do this for all
+                    ctx.built_functions.insert(id, value.clone());
+                    Ok(SteelVal::Closure(value))
+                }
+            } else {
+                Ok(SteelVal::Closure(Gc::new(ByteCodeLambda::from_serialized(
+                    ctx, c,
+                )?)))
+            }
+        }
+        SerializableSteelVal::BoolV(b) => Ok(SteelVal::BoolV(b)),
+        SerializableSteelVal::NumV(n) => Ok(SteelVal::NumV(n)),
+        SerializableSteelVal::IntV(i) => Ok(SteelVal::IntV(i)),
+        SerializableSteelVal::CharV(c) => Ok(SteelVal::CharV(c)),
+        SerializableSteelVal::Void => Ok(SteelVal::Void),
+        SerializableSteelVal::Rational(r) => Ok(SteelVal::Rational(r)),
+        SerializableSteelVal::StringV(s) => Ok(SteelVal::StringV(s.into())),
+        SerializableSteelVal::HashMapV(h) => Ok(SteelVal::HashMapV(
+            Gc::new(
+                h.into_iter()
+                    .map(|(k, v)| {
+                        Ok((
+                            from_serializable_value(ctx, k)?,
+                            from_serializable_value(ctx, v)?,
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?,
+            )
+            .into(),
+        )),
+        SerializableSteelVal::HashSet(h) => Ok(SteelVal::HashSetV(
+            Gc::new(
+                h.into_iter()
+                    .map(|k| from_serializable_value(ctx, k))
+                    .collect::<Result<HashSet<_>>>()?,
+            )
+            .into(),
+        )),
+        SerializableSteelVal::ListV(v) => Ok(SteelVal::ListV(
+            v.into_iter()
+                .map(|x| from_serializable_value(ctx, x))
+                .collect::<Result<_>>()?,
+        )),
+        SerializableSteelVal::VectorV(v) => Ok(SteelVal::VectorV(SteelVector(Gc::new(
+            v.into_iter()
+                .map(|x| from_serializable_value(ctx, x))
+                .collect::<Result<_>>()?,
+        )))),
+        SerializableSteelVal::SymbolV(s) => Ok(SteelVal::SymbolV(s.into())),
+        SerializableSteelVal::CustomStruct(s) => {
+            Ok(SteelVal::CustomStruct(Gc::new(UserDefinedStruct {
+                fields: {
+                    let fields = s
+                        .fields
+                        .into_iter()
+                        .map(|x| from_serializable_value(ctx, x));
+
+                    let mut recycle: crate::values::recycler::Recycle<SmallVec<_>> =
+                        crate::values::recycler::Recycle::new();
+
+                    for value in fields {
+                        recycle.push(value?);
+                    }
+
+                    recycle
+                },
+                type_descriptor: s.type_descriptor,
+            })))
+        }
+        SerializableSteelVal::HeapAllocated(v) => {
+            if let Some(mut guard) = ctx.fake_heap.get_mut(&v) {
+                match &mut guard {
+                    SerializedHeapRef::Serialized(value) => {
+                        let value = std::mem::take(value);
+                        if let Some(value) = value {
+                            let value = from_serializable_value(ctx, value)?;
+
+                            let allocation =
+                                ctx.thread.heap.lock().allocate_without_collection(value);
+
+                            ctx.fake_heap
+                                .insert(v, SerializedHeapRef::Closed(allocation.clone()));
+
+                            Ok(SteelVal::HeapAllocated(allocation))
+                        } else {
+                            match ctx.fake_heap.get(&v).unwrap() {
+                                SerializedHeapRef::Serialized(_) => {
+                                    // Introduce a third value: a sentinal value that will get patched back
+                                    // to the requisite value later.
+                                    let allocation = ctx
+                                        .thread
+                                        .heap
+                                        .lock()
+                                        .allocate_without_collection(SteelVal::Void);
+
+                                    ctx.values_to_fill_in.insert(v, allocation.clone());
+
+                                    Ok(SteelVal::HeapAllocated(allocation))
+                                }
+                                SerializedHeapRef::Closed(heap_ref) => {
+                                    Ok(SteelVal::HeapAllocated(heap_ref.clone()))
+                                }
+                            }
+                        }
+                    }
+
+                    SerializedHeapRef::Closed(c) => Ok(SteelVal::HeapAllocated(c.clone())),
+                }
+            } else {
+                // Shouldn't silently fail here, but we will... for now
+                panic!()
+            }
+        }
+        SerializableSteelVal::Pair(pair) => {
+            let (car, cdr) = *pair;
+
+            Ok(crate::values::lists::Pair::cons(
+                from_serializable_value(ctx, car)?,
+                from_serializable_value(ctx, cdr)?,
+            )
+            .into())
+        }
+        SerializableSteelVal::Stream(value) => Ok(SteelVal::StreamV(Gc::new(LazyStream {
+            initial_value: from_serializable_value(ctx, value.initial_value)?,
+            stream_thunk: from_serializable_value(ctx, value.stream_thunk)?,
+            empty_stream: value.empty_stream,
+        }))),
+        SerializableSteelVal::NativeRef(s) => {
+            let guard = ctx.thread.compiler.read();
+            let module_map = guard.builtin_modules.inner();
+
+            if let Some(m) = module_map.get(s.module.as_str()) {
+                return Ok(m.get(s.key));
+            }
+
+            panic!("Unable to find value in module map: {:#?}", s);
+        }
+        SerializableSteelVal::ByteVectorV(bytes) => {
+            Ok(SteelVal::ByteVector(SteelByteVector::new(bytes)))
+        }
+        SerializableSteelVal::StructConstructorSpec(mut spec) => {
+            // First, we need to patch any existing type descriptors to the new one.
+            spec.descriptor = *ctx.struct_map.get(&spec.descriptor).unwrap();
+            Ok(fetch_from_type_map(spec).unwrap())
+        }
+        SerializableSteelVal::ModuleSpec(m) => ctx
+            .thread
+            .compiler
+            .read()
+            .builtin_modules
+            .inner()
+            .get(m.as_str())
+            .unwrap()
+            .clone()
+            .into_steelval(),
+        SerializableSteelVal::GlobalRef(s) => {
+            let interned = s.into();
+            // Find the index of this thing:
+            let idx = ctx
+                .thread
+                .compiler
+                .read()
+                .symbol_map
+                .get(&interned)
+                .unwrap();
+            Ok(ctx.thread.global_env.roots()[idx].clone())
+        }
+        SerializableSteelVal::BuiltinSteelModuleRef(_, _) => todo!(),
+        SerializableSteelVal::Port(sendable_port) => Ok(SteelVal::PortV(
+            SteelPort::from_sendable_port(sendable_port),
+        )),
+        SerializableSteelVal::NativeStruct(name, items) => {
+            call_deserializer_by_name(ctx, &name, &items)
+                .expect("Unable to find the deserializer for this type")
+        }
+        SerializableSteelVal::HeapAllocatedVector(v) => {
+            if let Some(guard) = ctx.fake_vector_heap.get_mut(&v) {
+                match guard {
+                    SerializedHeapRefVector::Serialized(value) => {
+                        let value = std::mem::take(value);
+                        if let Some(value) = value {
+                            let mut converted = Vec::with_capacity(value.len());
+
+                            for v in value {
+                                converted.push(from_serializable_value(ctx, v)?);
+                            }
+
+                            let allocation = ctx
+                                .thread
+                                .heap
+                                .lock()
+                                .allocate_vec_without_collection(converted);
+
+                            ctx.fake_vector_heap
+                                .insert(v, SerializedHeapRefVector::Closed(allocation.clone()));
+
+                            Ok(SteelVal::MutableVector(allocation))
+                        } else {
+                            match ctx.fake_vector_heap.get(&v).unwrap() {
+                                SerializedHeapRefVector::Serialized(_) => {
+                                    // Introduce a third value: a sentinal value that will get patched back
+                                    // to the requisite value later.
+                                    let allocation = ctx
+                                        .thread
+                                        .heap
+                                        .lock()
+                                        .allocate_vec_without_collection(Vec::new());
+
+                                    ctx.vectors_to_fill_in.insert(v, allocation.clone());
+
+                                    Ok(SteelVal::MutableVector(allocation))
+                                }
+                                SerializedHeapRefVector::Closed(heap_ref) => {
+                                    Ok(SteelVal::MutableVector(heap_ref.clone()))
+                                }
+                            }
+                        }
+                    }
+
+                    SerializedHeapRefVector::Closed(c) => Ok(SteelVal::MutableVector(c.clone())),
+                }
+            } else {
+                // Shouldn't silently fail here, but we will... for now
+                panic!()
+            }
+        }
+    }
+}
+
+pub struct SerializationContext<'a> {
+    pub builtin_modules: &'a ModuleContainer,
+    pub serialized_heap: &'a mut std::collections::HashMap<usize, SerializableSteelVal>,
+    pub serialized_heap_vectors:
+        &'a mut std::collections::HashMap<usize, Vec<SerializableSteelVal>>,
+    pub visited: &'a mut std::collections::HashSet<usize>,
+    pub globals: &'a [SteelVal],
+    pub symbol_map: &'a SymbolMap,
+    pub constants: &'a ConstantMap,
+    pub reachable_globals: std::collections::HashSet<usize>,
+    pub reachable_structs: std::collections::HashSet<StructTypeDescriptor>,
+    pub compiled_modules: &'a ModuleManager,
+}
+
+// The serializable value needs to refer to the original heap -
+// that way can reference the original stuff easily.
+
+// TODO: Use the cycle detector instead
+
+pub fn into_serializable_value(
+    val: SteelVal,
+    ctx: &mut SerializationContext,
+) -> Result<SerializableSteelVal> {
+    match val {
+        SteelVal::Closure(c) => {
+            closure_into_serializable(&c, ctx).map(SerializableSteelVal::Closure)
+        }
+        SteelVal::BoolV(b) => Ok(SerializableSteelVal::BoolV(b)),
+        SteelVal::NumV(n) => Ok(SerializableSteelVal::NumV(n)),
+        SteelVal::IntV(n) => Ok(SerializableSteelVal::IntV(n)),
+        SteelVal::CharV(c) => Ok(SerializableSteelVal::CharV(c)),
+        SteelVal::Void => Ok(SerializableSteelVal::Void),
+        SteelVal::StringV(s) => Ok(SerializableSteelVal::StringV(s.to_string())),
+        SteelVal::FuncV(_) | SteelVal::BuiltIn(_) | SteelVal::MutFunc(_) => {
+            Ok(SerializableSteelVal::NativeRef(
+                // TODO: Native ref spec for anything that is native
+                // and truly can't be serialized between runtimes, such as native
+                // functions.
+                crate::steel_vm::vm::threads::create_native_ref(&ctx.builtin_modules, val.clone())
+                    .expect(&format!("Unable to find: {}", val)),
+            ))
+        }
+        SteelVal::ListV(l) => Ok(SerializableSteelVal::ListV(
+            l.into_iter()
+                .map(|x| into_serializable_value(x, ctx))
+                .collect::<Result<_>>()?,
+        )),
+        SteelVal::Pair(pair) => Ok(SerializableSteelVal::Pair(Box::new((
+            into_serializable_value(pair.car.clone(), ctx)?,
+            into_serializable_value(pair.cdr.clone(), ctx)?,
+        )))),
+        // This is going to be an issue with structs, probably. The generated functions there
+        // will need to be handled separately from this.
+        SteelVal::BoxedFunction(_) => {
+            // First, attempt a native ref:
+
+            if let Some(spec) =
+                crate::steel_vm::vm::threads::create_native_ref(&ctx.builtin_modules, val.clone())
+            {
+                Ok(SerializableSteelVal::NativeRef(spec))
+            } else if let Some(spec) = create_struct_spec(val.clone()) {
+                Ok(SerializableSteelVal::StructConstructorSpec(spec))
+
+                // Attempt to discover it from the struct registry
+                // todo!("{}", val)
+            } else {
+                // Check the globals:
+
+                for (idx, v) in ctx.globals.iter().enumerate() {
+                    if v.ptr_eq(&val) {
+                        // Get the name:
+                        let name = ctx.symbol_map.values()[idx];
+                        return Ok(SerializableSteelVal::GlobalRef(name.resolve().to_string()));
+                    }
+                }
+
+                panic!();
+            }
+        }
+
+        // TODO: These will also need to be interned, probably can do this through
+        // some constant pool and get back an index.
+        SteelVal::SymbolV(s) => Ok(SerializableSteelVal::SymbolV(s.to_string())),
+        SteelVal::HashMapV(v) => Ok(SerializableSteelVal::HashMapV(
+            v.0.unwrap()
+                .into_iter()
+                .map(|(k, v)| {
+                    let kprime = into_serializable_value(k, ctx)?;
+                    let vprime = into_serializable_value(v, ctx)?;
+
+                    Ok((kprime, vprime))
+                })
+                .collect::<Result<_>>()?,
+        )),
+
+        SteelVal::Custom(c) => {
+            let mut guard = c.write();
+
+            if let Some(output) = guard.as_serializable_steelval() {
+                Ok(output)
+            } else
+            // Check the tags that exist for serialization:
+            if let Some(value) = guard.as_serializable_steelval_with_ctx(ctx) {
+                value
+            } else {
+                stop!(Generic => "Custom type not allowed to be moved across threads!: {}", guard.name())
+            }
+        }
+
+        SteelVal::CustomStruct(s) => {
+            // Mark that we visited this, and that it will need to be
+            // present on the other side.
+            ctx.reachable_structs.insert(s.type_descriptor);
+
+            Ok(SerializableSteelVal::CustomStruct(
+                SerializableUserDefinedStruct {
+                    fields: s
+                        .fields
+                        .iter()
+                        .cloned()
+                        .map(|x| into_serializable_value(x, ctx))
+                        .collect::<Result<Vec<_>>>()?,
+                    type_descriptor: s.type_descriptor,
+                },
+            ))
+        }
+
+        SteelVal::PortV(p) => SendablePort::from_port(p).map(SerializableSteelVal::Port),
+        // SteelVal::PortV(p) => Ok(SerializableSteelVal::Void),
+
+        // If there is a cycle, this could cause problems?
+        SteelVal::HeapAllocated(h) => {
+            // We should pick it up on the way back the recursion
+            if ctx.visited.contains(&h.as_ptr_usize())
+                && !ctx.serialized_heap.contains_key(&h.as_ptr_usize())
+            {
+                Ok(SerializableSteelVal::HeapAllocated(h.as_ptr_usize()))
+            } else {
+                ctx.visited.insert(h.as_ptr_usize());
+
+                if ctx.serialized_heap.contains_key(&h.as_ptr_usize()) {
+                    Ok(SerializableSteelVal::HeapAllocated(h.as_ptr_usize()))
+                } else {
+                    let value = into_serializable_value(h.get(), ctx)?;
+                    ctx.serialized_heap.insert(h.as_ptr_usize(), value);
+                    Ok(SerializableSteelVal::HeapAllocated(h.as_ptr_usize()))
+                }
+            }
+        }
+
+        SteelVal::VectorV(vector) => Ok(SerializableSteelVal::VectorV(
+            vector
+                .iter()
+                .cloned()
+                .map(|val| into_serializable_value(val, ctx))
+                .collect::<Result<_>>()?,
+        )),
+
+        SteelVal::ByteVector(bytes) => {
+            Ok(SerializableSteelVal::ByteVectorV(bytes.vec.read().clone()))
+        }
+
+        SteelVal::Rational(r) => Ok(SerializableSteelVal::Rational(r)),
+
+        SteelVal::StreamV(s) => Ok(SerializableSteelVal::Stream(Box::new(SerializableStream {
+            initial_value: into_serializable_value(s.initial_value.clone(), ctx)?,
+            stream_thunk: into_serializable_value(s.stream_thunk.clone(), ctx)?,
+            empty_stream: s.empty_stream,
+        }))),
+
+        SteelVal::HashSetV(s) => Ok(SerializableSteelVal::HashSet(
+            s.iter()
+                .cloned()
+                .map(|val| into_serializable_value(val, ctx))
+                .collect::<Result<_>>()?,
+        )),
+
+        SteelVal::MutableVector(v) => {
+            // We should pick it up on the way back the recursion
+            if ctx.visited.contains(&v.as_ptr_usize())
+                && !ctx.serialized_heap_vectors.contains_key(&v.as_ptr_usize())
+            {
+                Ok(SerializableSteelVal::HeapAllocatedVector(v.as_ptr_usize()))
+            } else {
+                ctx.visited.insert(v.as_ptr_usize());
+
+                if ctx.serialized_heap.contains_key(&v.as_ptr_usize()) {
+                    Ok(SerializableSteelVal::HeapAllocatedVector(v.as_ptr_usize()))
+                } else {
+                    // Let values:
+
+                    let guard = v.strong_ptr();
+                    let read_guard = guard.read();
+
+                    let mut values = Vec::with_capacity(read_guard.value.len());
+
+                    for v in read_guard.value.iter() {
+                        values.push(into_serializable_value(v.clone(), ctx)?);
+                    }
+
+                    ctx.serialized_heap_vectors.insert(v.as_ptr_usize(), values);
+                    Ok(SerializableSteelVal::HeapAllocatedVector(v.as_ptr_usize()))
+                }
+            }
+        }
+
+        illegal => stop!(Generic => "Type not allowed to be moved across threads!: {}", illegal),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteelMutableVector(pub(crate) Gc<RefCell<Vec<SteelVal>>>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteelVector(pub(crate) Gc<Vector<SteelVal>>);
+
+impl FromIterator<SteelVal> for SteelVector {
+    fn from_iter<T: IntoIterator<Item = SteelVal>>(iter: T) -> Self {
+        let vec = Vector::from_iter(iter);
+        SteelVector(Gc::new(vec))
+    }
+}
+
+impl Deref for SteelVector {
+    type Target = Vector<SteelVal>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Gc<Vector<SteelVal>>> for SteelVector {
+    fn from(value: Gc<Vector<SteelVal>>) -> Self {
+        SteelVector(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteelHashMap(pub(crate) Gc<HashMap<SteelVal, SteelVal>>);
+
+#[cfg(feature = "imbl")]
+impl Hash for SteelHashMap {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        for i in self.iter() {
+            i.hash(state);
+        }
+    }
+}
+
+impl Deref for SteelHashMap {
+    type Target = HashMap<SteelVal, SteelVal>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Gc<HashMap<SteelVal, SteelVal>>> for SteelHashMap {
+    fn from(value: Gc<HashMap<SteelVal, SteelVal>>) -> Self {
+        SteelHashMap(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteelHashSet(pub(crate) Gc<HashSet<SteelVal>>);
+
+#[cfg(feature = "imbl")]
+impl Hash for SteelHashSet {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        for i in self.iter() {
+            i.hash(state);
+        }
+    }
+}
+
+impl Deref for SteelHashSet {
+    type Target = HashSet<SteelVal>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Gc<HashSet<SteelVal>>> for SteelHashSet {
+    fn from(value: Gc<HashSet<SteelVal>>) -> Self {
+        SteelHashSet(value)
+    }
+}
+
+pub enum TypeKind {
+    Any,
+    Bool,
+    Num,
+    Int,
+    Char,
+    Vector(Box<TypeKind>),
+    Void,
+    String,
+    Function,
+    HashMap(Box<TypeKind>, Box<TypeKind>),
+    HashSet(Box<TypeKind>),
+    List(Box<TypeKind>),
+}
+
+/// A value as represented in the runtime.
+#[repr(C, u8)]
+pub enum SteelVal {
+    /// Represents a bytecode closure.
+    Closure(Gc<ByteCodeLambda>),
+    /// Represents a boolean value.
+    BoolV(bool),
+    /// Represents a number, currently only f64 numbers are supported.
+    NumV(f64),
+    /// Represents an integer.
+    IntV(isize),
+    /// Represents a rational number.
+    Rational(Rational32),
+    /// Represents a character type
+    CharV(char),
+    /// Vectors are represented as `im_rc::Vector`'s, which are immutable
+    /// data structures
+    VectorV(SteelVector),
+    /// Void return value
+    Void,
+    /// Represents strings
+    StringV(SteelString),
+    /// Represents built in rust functions
+    FuncV(FunctionSignature),
+    /// Represents a symbol, internally represented as `String`s
+    SymbolV(SteelString),
+    /// Container for a type that implements the `Custom Type` trait. (trait object)
+    Custom(GcMut<Box<dyn CustomType>>), // TODO: @Matt - consider using just a mutex here, to relax some of the bounds?
+    // Embedded HashMap
+    HashMapV(SteelHashMap),
+    // Embedded HashSet
+    HashSetV(SteelHashSet),
+    /// Represents a scheme-only struct
+    CustomStruct(Gc<UserDefinedStruct>),
+    /// Represents a port object
+    PortV(SteelPort),
+    /// Generic iterator wrapper
+    IterV(Gc<Transducer>),
+    /// Reducers
+    ReducerV(Gc<Reducer>),
+    /// Async Function wrapper
+    FutureFunc(BoxedAsyncFunctionSignature),
+    // Boxed Future Result
+    FutureV(Gc<FutureResult>),
+    // A stream of `SteelVal`.
+    StreamV(Gc<LazyStream>),
+    /// Custom closure
+    BoxedFunction(Gc<BoxedDynFunction>),
+    // Continuation
+    ContinuationFunction(Continuation),
+    // Function Pointer
+    // #[cfg(feature = "jit")]
+    // CompiledFunction(Box<JitFunctionPointer>),
+    // List
+    ListV(crate::values::lists::List<SteelVal>),
+    // Holds a pair that contains 2 `SteelVal`.
+    Pair(Gc<crate::values::lists::Pair>),
+    // Mutable functions
+    MutFunc(MutFunctionSignature),
+    // Built in functions
+    BuiltIn(BuiltInSignature),
+    // Mutable vector
+    MutableVector(HeapRef<Vec<SteelVal>>),
+    // This should delegate to the underlying iterator - can allow for faster raw iteration if possible
+    // Should allow for polling just a raw "next" on underlying elements
+    BoxedIterator(GcMut<OpaqueIterator>),
+    // Contains a syntax object.
+    SyntaxObject(Gc<Syntax>),
+    // Mutable storage, with Gc backing
+    // Boxed(HeapRef),
+    Boxed(GcMut<SteelVal>),
+    // Holds a SteelVal on the heap.
+    HeapAllocated(HeapRef<SteelVal>),
+    // TODO: This itself, needs to be boxed unfortunately.
+    Reference(Gc<OpaqueReference<'static>>),
+    // Like IntV but supports larger values.
+    BigNum(Gc<BigInt>),
+    // Like Rational but supports larger numerators and denominators.
+    BigRational(Gc<BigRational>),
+    // A complex number.
+    Complex(Gc<SteelComplex>),
+    // Byte vectors
+    ByteVector(SteelByteVector),
+}
+
+impl Clone for SteelVal {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        match self {
+            Closure(gc) => Self::Closure(Gc::clone(gc)),
+            BoolV(b) => Self::BoolV(*b),
+            NumV(n) => Self::NumV(*n),
+            IntV(i) => Self::IntV(*i),
+            Rational(ratio) => Self::Rational(*ratio),
+            CharV(c) => Self::CharV(*c),
+            VectorV(steel_vector) => Self::VectorV(steel_vector.clone()),
+            Void => Self::Void,
+            StringV(steel_string) => Self::StringV(steel_string.clone()),
+            FuncV(f) => Self::FuncV(*f),
+            SymbolV(steel_string) => Self::SymbolV(steel_string.clone()),
+            SteelVal::Custom(gc) => SteelVal::Custom(gc.clone()),
+            HashMapV(steel_hash_map) => SteelVal::HashMapV(steel_hash_map.clone()),
+            HashSetV(steel_hash_set) => SteelVal::HashSetV(steel_hash_set.clone()),
+            CustomStruct(gc) => SteelVal::CustomStruct(gc.clone()),
+            PortV(steel_port) => SteelVal::PortV(steel_port.clone()),
+            IterV(gc) => SteelVal::IterV(gc.clone()),
+            ReducerV(gc) => SteelVal::ReducerV(gc.clone()),
+            FutureFunc(f) => SteelVal::FutureFunc(f.clone()),
+            FutureV(gc) => SteelVal::FutureV(gc.clone()),
+            StreamV(gc) => SteelVal::StreamV(gc.clone()),
+            BoxedFunction(gc) => SteelVal::BoxedFunction(gc.clone()),
+            ContinuationFunction(continuation) => {
+                SteelVal::ContinuationFunction(continuation.clone())
+            }
+            ListV(generic_list) => SteelVal::ListV(generic_list.clone()),
+            SteelVal::Pair(gc) => SteelVal::Pair(gc.clone()),
+            MutFunc(f) => SteelVal::MutFunc(*f),
+            BuiltIn(f) => SteelVal::BuiltIn(*f),
+            MutableVector(heap_ref) => SteelVal::MutableVector(heap_ref.clone()),
+            BoxedIterator(gc) => SteelVal::BoxedIterator(gc.clone()),
+            SteelVal::SyntaxObject(gc) => SteelVal::SyntaxObject(gc.clone()),
+            Boxed(gc) => SteelVal::Boxed(gc.clone()),
+            HeapAllocated(heap_ref) => SteelVal::HeapAllocated(heap_ref.clone()),
+            Reference(gc) => SteelVal::Reference(gc.clone()),
+            BigNum(gc) => SteelVal::BigNum(gc.clone()),
+            SteelVal::BigRational(gc) => SteelVal::BigRational(gc.clone()),
+            Complex(gc) => SteelVal::Complex(gc.clone()),
+            ByteVector(steel_byte_vector) => SteelVal::ByteVector(steel_byte_vector.clone()),
+        }
+    }
+}
+
+impl Default for SteelVal {
+    fn default() -> Self {
+        SteelVal::Void
+    }
+}
+
+// Avoid as much dropping as possible. Otherwise we thrash the drop impl
+// on steel values.
+#[cfg(feature = "sync")]
+pub(crate) enum SteelValPointer {
+    /// Represents a bytecode closure.
+    Closure(*const ByteCodeLambda),
+    VectorV(*const Vector<SteelVal>),
+    Custom(*const RwLock<Box<dyn CustomType>>),
+    HashMapV(*const HashMap<SteelVal, SteelVal>),
+    HashSetV(*const HashSet<SteelVal>),
+    CustomStruct(*const UserDefinedStruct),
+    IterV(*const Transducer),
+    ReducerV(*const Reducer),
+    StreamV(*const LazyStream),
+    ContinuationFunction(*const RwLock<ContinuationMark>),
+    ListV(crate::values::lists::CellPointer<SteelVal>),
+    Pair(*const crate::values::lists::Pair),
+    MutableVector(HeapRef<Vec<SteelVal>>),
+    SyntaxObject(*const Syntax),
+    BoxedIterator(*const RwLock<OpaqueIterator>),
+    Boxed(*const RwLock<SteelVal>),
+    HeapAllocated(HeapRef<SteelVal>),
+}
+
+#[cfg(feature = "sync")]
+unsafe impl Sync for SteelValPointer {}
+#[cfg(feature = "sync")]
+unsafe impl Send for SteelValPointer {}
+
+#[cfg(feature = "sync")]
+impl SteelValPointer {
+    pub(crate) fn from_value(value: &SteelVal) -> Option<Self> {
+        match value {
+            Closure(gc) => Some(Self::Closure(gc.as_ptr())),
+            VectorV(steel_vector) => Some(Self::VectorV(steel_vector.0.as_ptr())),
+            SteelVal::Custom(gc) => Some(Self::Custom(gc.as_ptr())),
+            HashMapV(steel_hash_map) => Some(Self::HashMapV(steel_hash_map.0.as_ptr())),
+            HashSetV(steel_hash_set) => Some(Self::HashSetV(steel_hash_set.0.as_ptr())),
+            CustomStruct(gc) => Some(Self::CustomStruct(gc.as_ptr())),
+            IterV(gc) => Some(Self::IterV(gc.as_ptr())),
+            ReducerV(gc) => Some(Self::ReducerV(gc.as_ptr())),
+            StreamV(gc) => Some(Self::StreamV(gc.as_ptr())),
+            ListV(generic_list) => Some(Self::ListV(generic_list.as_ptr())),
+            Pair(gc) => Some(Self::Pair(gc.as_ptr())),
+            SteelVal::ContinuationFunction(continuation) => Some(Self::ContinuationFunction(
+                crate::gc::shared::StandardShared::as_ptr(&continuation.inner),
+            )),
+            // TODO: See if we can avoid these clones?
+            MutableVector(heap_ref) => Some(Self::MutableVector(heap_ref.clone())),
+            BoxedIterator(gc) => Some(Self::BoxedIterator(gc.as_ptr())),
+            SteelVal::SyntaxObject(gc) => Some(Self::SyntaxObject(gc.as_ptr())),
+            Boxed(gc) => Some(Self::Boxed(gc.as_ptr())),
+            // TODO: See if we can avoid these clones?
+            HeapAllocated(heap_ref) => Some(Self::HeapAllocated(heap_ref.clone())),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "sync")]
+#[test]
+fn check_send_sync() {
+    let value = SteelVal::IntV(10);
+
+    let handle = std::thread::spawn(move || value);
+
+    handle.join().unwrap();
+}
+
+#[derive(Clone, Debug)]
+pub struct SteelByteVector {
+    pub(crate) vec: GcMut<Vec<u8>>,
+}
+
+impl SteelByteVector {
+    pub fn new(vec: Vec<u8>) -> Self {
+        Self {
+            vec: Gc::new_mut(vec),
+        }
+    }
+}
+
+impl PartialEq for SteelByteVector {
+    fn eq(&self, other: &Self) -> bool {
+        *(self.vec.read()) == *(other.vec.read())
+    }
+}
+
+impl Eq for SteelByteVector {}
+
+impl Hash for SteelByteVector {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.vec.read().hash(state);
+    }
+}
+
+/// Contains a complex number.
+///
+/// TODO: Optimize the contents of complex value. Holding `SteelVal` makes it easier to use existing
+/// operations but a more specialized representation may be faster.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct SteelComplex {
+    /// The real part of the complex number.
+    pub re: SteelVal,
+    /// The imaginary part of the complex number.
+    pub im: SteelVal,
+}
+
+impl SteelComplex {
+    pub fn new(real: SteelVal, imaginary: SteelVal) -> SteelComplex {
+        SteelComplex {
+            re: real,
+            im: imaginary,
+        }
+    }
+
+    /// Returns `true` if the imaginary part is negative.
+    pub(crate) fn imaginary_is_negative(&self) -> bool {
+        match &self.im {
+            NumV(x) => x.is_negative(),
+            IntV(x) => x.is_negative(),
+            Rational(x) => x.is_negative(),
+            BigNum(x) => x.is_negative(),
+            SteelVal::BigRational(x) => x.is_negative(),
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn imaginary_is_finite(&self) -> bool {
+        match &self.im {
+            NumV(x) => x.is_finite(),
+            IntV(_) | Rational(_) | BigNum(_) | SteelVal::BigRational(_) => true,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl IntoSteelVal for SteelComplex {
+    #[inline(always)]
+    fn into_steelval(self) -> Result<SteelVal> {
+        Ok(match self.im {
+            NumV(n) if n.is_zero() => self.re,
+            IntV(0) => self.re,
+            _ => SteelVal::Complex(Gc::new(self)),
+        })
+    }
+}
+
+impl fmt::Display for SteelComplex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.imaginary_is_negative() || !self.imaginary_is_finite() {
+            write!(f, "{re}{im}i", re = self.re, im = self.im)
+        } else {
+            write!(f, "{re}+{im}i", re = self.re, im = self.im)
+        }
+    }
+}
+
+impl SteelVal {
+    // TODO: Re-evaluate this - should this be buffered?
+    pub fn new_dyn_writer_port(port: impl Write + Send + Sync + 'static) -> SteelVal {
+        SteelVal::PortV(SteelPort {
+            port: Gc::new_lock(SteelPortRepr::DynWriter(Arc::new(Mutex::new(port)))),
+        })
+    }
+
+    pub fn anonymous_boxed_function(
+        function: alloc::sync::Arc<
+            dyn Fn(&[SteelVal]) -> crate::rvals::Result<SteelVal> + Send + Sync + 'static,
+        >,
+    ) -> SteelVal {
+        SteelVal::BoxedFunction(Gc::new(BoxedDynFunction {
+            function,
+            name: None,
+            arity: None,
+        }))
+    }
+
+    pub fn as_box(&self) -> Option<HeapRef<SteelVal>> {
+        if let SteelVal::HeapAllocated(heap_ref) = self {
+            Some(heap_ref.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn as_box_to_inner(&self) -> Option<SteelVal> {
+        self.as_box().map(|x| x.get())
+    }
+
+    pub fn as_ptr_usize(&self) -> Option<usize> {
+        match self {
+            Closure(l) => Some(l.as_ptr() as usize),
+            VectorV(v) => Some(v.0.as_ptr() as usize),
+            // Void => todo!(),
+            StringV(s) => Some(s.0.as_ptr() as usize),
+            FuncV(_) => todo!(),
+            // SymbolV(_) => todo!(),
+            // SteelVal::Custom(_) => todo!(),
+            HashMapV(h) => Some(h.0.as_ptr() as usize),
+            HashSetV(h) => Some(h.0.as_ptr() as usize),
+            CustomStruct(c) => Some(c.as_ptr() as usize),
+            // PortV(_) => todo!(),
+            // IterV(_) => todo!(),
+            // ReducerV(_) => todo!(),
+            // FutureFunc(_) => todo!(),
+            // FutureV(_) => todo!(),
+            // StreamV(_) => todo!(),
+            // BoxedFunction(_) => todo!(),
+            // ContinuationFunction(_) => todo!(),
+            ListV(l) => Some(l.as_ptr_usize()),
+            MutableVector(v) => Some(v.as_ptr_usize()),
+            Custom(c) => Some(c.as_ptr() as usize),
+            // BoxedIterator(_) => todo!(),
+            // SteelVal::SyntaxObject(_) => todo!(),
+            Boxed(b) => Some(b.as_ptr() as usize),
+            HeapAllocated(h) => Some(h.as_ptr_usize()),
+            Pair(p) => Some(p.as_ptr() as usize),
+            SyntaxObject(s) => Some(s.as_ptr() as usize),
+            // Reference(_) => todo!(),
+            BigNum(b) => Some(b.as_ptr() as usize),
+            _ => None,
+        }
+    }
+
+    // pub(crate) fn children_mut<'a>(&'a mut self) -> impl IntoIterator<Item = SteelVal> {
+    //     match self {
+    //         Self::CustomStruct(inner) => {
+    //             if let Some(inner) = inner.get_mut() {
+    //                 core::mem::take(&mut inner.borrow_mut().fields)
+    //             } else {
+    //                 core::iter::empty()
+    //             }
+    //         }
+    //         _ => todo!(),
+    //     }
+    // }
+}
+
+// TODO: Consider unboxed value types, for optimized usages when compiling segments of code.
+// If we can infer the types from the concrete functions used, we don't need to have unboxed values -> We also
+// can use concrete forms of the underlying functions as well.
+// #[derive(Clone)]
+// pub enum UnboxedSteelVal {
+//     /// Represents a boolean value
+//     BoolV(bool),
+//     /// Represents a number, currently only f64 numbers are supported
+//     NumV(f64),
+//     /// Represents an integer
+//     IntV(isize),
+//     /// Represents a character type
+//     CharV(char),
+//     /// Vectors are represented as `im_rc::Vector`'s, which are immutable
+//     /// data structures
+//     VectorV(Vector<SteelVal>),
+//     /// Void return value
+//     Void,
+//     /// Represents strings
+//     StringV(SteelString),
+//     /// Represents built in rust functions
+//     FuncV(FunctionSignature),
+//     /// Represents a symbol, internally represented as `String`s
+//     SymbolV(SteelString),
+//     /// Container for a type that implements the `Custom Type` trait. (trait object)
+//     Custom(Gc<RefCell<Box<dyn CustomType>>>),
+//     // Embedded HashMap
+//     HashMapV(HashMap<SteelVal, SteelVal>),
+//     // Embedded HashSet
+//     HashSetV(HashSet<SteelVal>),
+//     /// Represents a scheme-only struct
+//     // StructV(Gc<SteelStruct>),
+//     /// Alternative implementation of a scheme-only struct
+//     CustomStruct(Gc<RefCell<UserDefinedStruct>>),
+//     // Represents a special rust closure
+//     // StructClosureV(Box<SteelStruct>, StructClosureSignature),
+//     // StructClosureV(Box<StructClosure>),
+//     /// Represents a port object
+//     PortV(SteelPort),
+//     /// Represents a bytecode closure
+//     Closure(Gc<ByteCodeLambda>),
+//     /// Generic iterator wrapper
+//     IterV(Gc<Transducer>),
+//     /// Reducers
+//     ReducerV(Gc<Reducer>),
+//     // Reducer(Reducer)
+//     // Generic IntoIter wrapper
+//     // Promise(Gc<SteelVal>),
+//     /// Async Function wrapper
+//     FutureFunc(BoxedAsyncFunctionSignature),
+//     // Boxed Future Result
+//     FutureV(Gc<FutureResult>),
+
+//     StreamV(Gc<LazyStream>),
+//     // Break the cycle somehow
+//     // EvaluationEnv(Weak<RefCell<Env>>),
+//     /// Contract
+//     Contract(Gc<ContractType>),
+//     /// Contracted Function
+//     ContractedFunction(Gc<ContractedFunction>),
+//     /// Custom closure
+//     BoxedFunction(BoxedFunctionSignature),
+//     // Continuation
+//     ContinuationFunction(Gc<Continuation>),
+//     // List
+//     ListV(List<SteelVal>),
+//     // Mutable functions
+//     MutFunc(MutFunctionSignature),
+//     // Built in functions
+//     BuiltIn(BuiltInSignature),
+//     // Mutable vector
+//     MutableVector(Gc<RefCell<Vec<SteelVal>>>),
+//     // This should delegate to the underlying iterator - can allow for faster raw iteration if possible
+//     // Should allow for polling just a raw "next" on underlying elements
+//     BoxedIterator(Gc<RefCell<BuiltInDataStructureIterator>>),
+
+//     SyntaxObject(Gc<Syntax>),
+
+//     // Mutable storage, with Gc backing
+//     Boxed(HeapRef),
+// }
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(C)]
+pub struct SteelString(pub(crate) Gc<String>);
+
+impl Deref for SteelString {
+    type Target = crate::gc::Shared<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0 .0
+    }
+}
+
+#[cfg(not(feature = "sync"))]
+impl From<Arc<String>> for SteelString {
+    fn from(value: Arc<String>) -> Self {
+        SteelString(Gc(Rc::new((*value).clone())))
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "triomphe", not(feature = "biased")))]
+impl From<Arc<String>> for SteelString {
+    fn from(value: Arc<String>) -> Self {
+        SteelString(Gc(triomphe::Arc::new((*value).clone())))
+    }
+}
+
+#[cfg(all(feature = "sync", feature = "biased", not(feature = "triomphe")))]
+impl From<Arc<String>> for SteelString {
+    fn from(value: Arc<String>) -> Self {
+        SteelString(Gc(steel_rc::BiasedRc::new((*value).clone())))
+    }
+}
+
+impl From<&str> for SteelString {
+    fn from(val: &str) -> Self {
+        SteelString(Gc::new(val.to_string()))
+    }
+}
+
+impl From<&String> for SteelString {
+    fn from(val: &String) -> Self {
+        SteelString(Gc::new(val.to_owned()))
+    }
+}
+
+impl From<String> for SteelString {
+    fn from(val: String) -> Self {
+        SteelString(Gc::new(val))
+    }
+}
+
+impl From<crate::gc::Shared<String>> for SteelString {
+    fn from(val: crate::gc::Shared<String>) -> Self {
+        SteelString(Gc(val))
+    }
+}
+
+impl From<Gc<String>> for SteelString {
+    fn from(val: Gc<String>) -> Self {
+        SteelString(val)
+    }
+}
+
+impl From<SteelString> for crate::gc::Shared<String> {
+    fn from(value: SteelString) -> Self {
+        value.0 .0
+    }
+}
+
+impl From<SteelString> for Gc<String> {
+    fn from(value: SteelString) -> Self {
+        value.0
+    }
+}
+
+impl core::fmt::Display for SteelString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.as_str())
+    }
+}
+
+impl core::fmt::Debug for SteelString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0.as_str())
+    }
+}
+
+// Check that steel values aren't growing without us knowing
+const _ASSERT_SMALL: () = assert!(core::mem::size_of::<SteelVal>() <= 16);
+
+#[test]
+fn check_size_of_steelval() {
+    assert_eq!(core::mem::size_of::<SteelVal>(), 16);
+}
+
+pub struct Chunks {
+    remaining: IntoIter<char>,
+}
+
+impl Chunks {
+    fn new(s: SteelString) -> Self {
+        Chunks {
+            remaining: s.chars().collect::<Vec<_>>().into_iter(),
+        }
+    }
+}
+
+pub struct OpaqueIterator {
+    pub(crate) root: SteelVal,
+    iterator: BuiltInDataStructureIterator,
+}
+
+impl Custom for OpaqueIterator {
+    fn fmt(&self) -> Option<core::result::Result<String, core::fmt::Error>> {
+        Some(Ok("#<iterator>".to_owned()))
+    }
+}
+
+// TODO: Convert this to just a generic custom type. This does not have to be
+// a special enum variant.
+pub enum BuiltInDataStructureIterator {
+    List(crate::values::lists::ConsumingIterator<SteelVal>),
+    Vector(VectorConsumingIter<SteelVal>),
+    Set(HashSetConsumingIter<SteelVal>),
+    Map(HashMapConsumingIter<SteelVal, SteelVal>),
+    String(Chunks),
+    #[cfg(not(feature = "sync"))]
+    Opaque(Box<dyn Iterator<Item = SteelVal>>),
+    #[cfg(feature = "sync")]
+    Opaque(Box<dyn Iterator<Item = SteelVal> + Send + Sync + 'static>),
+}
+
+impl BuiltInDataStructureIterator {
+    pub fn into_boxed_iterator(self, value: SteelVal) -> SteelVal {
+        SteelVal::BoxedIterator(Gc::new_mut(OpaqueIterator {
+            root: value,
+            iterator: self,
+        }))
+    }
+}
+
+impl BuiltInDataStructureIterator {
+    pub fn from_iterator<
+        T: IntoSteelVal + MaybeSendSyncStatic,
+        I: Iterator<Item = T> + MaybeSendSyncStatic,
+        S: IntoIterator<Item = T, IntoIter = I> + MaybeSendSyncStatic,
+    >(
+        value: S,
+    ) -> Self {
+        Self::Opaque(Box::new(
+            value
+                .into_iter()
+                .map(|x| x.into_steelval().expect("This shouldn't fail!")),
+        ))
+    }
+}
+
+impl Iterator for BuiltInDataStructureIterator {
+    type Item = SteelVal;
+
+    fn next(&mut self) -> Option<SteelVal> {
+        match self {
+            Self::List(l) => l.next(),
+            Self::Vector(v) => v.next(),
+            Self::String(s) => s.remaining.next().map(SteelVal::CharV),
+            Self::Set(s) => s.next(),
+            Self::Map(s) => s
+                .next()
+                .map(|x| SteelVal::Pair(Gc::new(Pair::cons(x.0, x.1)))),
+            Self::Opaque(s) => s.next(),
+        }
+    }
+}
+
+pub fn value_into_iterator(val: SteelVal) -> Option<SteelVal> {
+    let root = val.clone();
+    match val {
+        SteelVal::ListV(l) => Some(BuiltInDataStructureIterator::List(l.into_iter())),
+        SteelVal::VectorV(v) => Some(BuiltInDataStructureIterator::Vector(
+            (*v).clone().into_iter(),
+        )),
+        SteelVal::StringV(s) => Some(BuiltInDataStructureIterator::String(Chunks::new(s))),
+        SteelVal::HashSetV(s) => Some(BuiltInDataStructureIterator::Set((*s).clone().into_iter())),
+        SteelVal::HashMapV(m) => Some(BuiltInDataStructureIterator::Map((*m).clone().into_iter())),
+        // TODO: Add byte vectors here
+        _ => None,
+    }
+    .map(|iterator| BuiltInDataStructureIterator::into_boxed_iterator(iterator, root))
+}
+
+thread_local! {
+    pub static ITERATOR_FINISHED: SteelVal = SteelVal::SymbolV("done".into());
+}
+
+pub fn iterator_next(args: &[SteelVal]) -> Result<SteelVal> {
+    match &args[0] {
+        SteelVal::BoxedIterator(b) => match b.write().iterator.next() {
+            Some(v) => Ok(v),
+            None => Ok(ITERATOR_FINISHED.with(|x| x.clone())),
+        },
+        _ => stop!(TypeMismatch => "Unexpected argument"),
+    }
+}
+
+impl SteelVal {
+    pub fn boxed(value: SteelVal) -> SteelVal {
+        SteelVal::Boxed(Gc::new_mut(value))
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &SteelVal) -> bool {
+        match (self, other) {
+            // Integers are a special case of ptr eq -> if integers are equal? they are also eq?
+            (IntV(l), IntV(r)) => l == r,
+            (NumV(l), NumV(r)) => l == r,
+            (BoolV(l), BoolV(r)) => l == r,
+            (CharV(l), CharV(r)) => l == r,
+            (VectorV(l), VectorV(r)) => Gc::ptr_eq(&l.0, &r.0),
+            (Void, Void) => true,
+            (StringV(l), StringV(r)) => crate::gc::Shared::ptr_eq(l, r),
+            (FuncV(l), FuncV(r)) => *l as usize == *r as usize,
+            (SymbolV(l), SymbolV(r)) => crate::gc::Shared::ptr_eq(l, r),
+            (SteelVal::Custom(l), SteelVal::Custom(r)) => Gc::ptr_eq(l, r),
+            (HashMapV(l), HashMapV(r)) => Gc::ptr_eq(&l.0, &r.0),
+            (HashSetV(l), HashSetV(r)) => Gc::ptr_eq(&l.0, &r.0),
+            (PortV(l), PortV(r)) => Gc::ptr_eq(&l.port, &r.port),
+            (Closure(l), Closure(r)) => Gc::ptr_eq(l, r),
+            (IterV(l), IterV(r)) => Gc::ptr_eq(l, r),
+            (ReducerV(l), ReducerV(r)) => Gc::ptr_eq(l, r),
+            (FutureFunc(l), FutureFunc(r)) => crate::gc::Shared::ptr_eq(l, r),
+            (FutureV(l), FutureV(r)) => Gc::ptr_eq(l, r),
+            (StreamV(l), StreamV(r)) => Gc::ptr_eq(l, r),
+            (BoxedFunction(l), BoxedFunction(r)) => Gc::ptr_eq(l, r),
+            (ContinuationFunction(l), ContinuationFunction(r)) => Continuation::ptr_eq(l, r),
+            (ListV(l), ListV(r)) => {
+                // Happy path
+                l.ptr_eq(r) || l.storage_ptr_eq(r) || (l.is_empty() && r.is_empty()) || {
+                    slow_path_eq_lists(l, r)
+                }
+            }
+            (MutFunc(l), MutFunc(r)) => *l as usize == *r as usize,
+            (BuiltIn(l), BuiltIn(r)) => *l as usize == *r as usize,
+            (MutableVector(l), MutableVector(r)) => HeapRef::ptr_eq(l, r),
+            (BigNum(l), BigNum(r)) => Gc::ptr_eq(l, r),
+            (ByteVector(l), ByteVector(r)) => Gc::ptr_eq(&l.vec, &r.vec),
+            (Pair(l), Pair(r)) => Gc::ptr_eq(l, r),
+            (_, _) => {
+                // dbg!(pointers);
+                false
+            }
+        }
+    }
+}
+
+// How can we keep track of the provenance of where the pointers go?
+// for pointer equality?
+#[inline]
+fn slow_path_eq_lists(
+    _l: &crate::values::lists::List<SteelVal>,
+    _r: &crate::values::lists::List<SteelVal>,
+) -> bool {
+    false
+
+    /*
+
+    // If the next pointers are the same,
+    // then we need to check the values of the
+    // current node for equality. There is now the possibility
+    // that the previous version of this doesn't match up, and
+    // we need to keep the history of the previous values in order
+    // to do this properly.
+    //
+    // I think we can only really do this _if_ the next pointer
+    // exists. Otherwise this doesn't really make sense
+    let left_next = l.next_ptr_as_usize();
+    let right_next = r.next_ptr_as_usize();
+
+    if left_next.is_some() && right_next.is_some() && left_next == right_next && l.len() == r.len()
+    {
+        let left_iter = l.current_node_iter();
+        let right_iter = r.current_node_iter();
+
+        for (l, r) in left_iter.zip(right_iter) {
+            if l != r {
+                return false;
+            }
+        }
+
+        true
+    } else {
+        false
+    }
+
+    */
+}
+
+impl Hash for SteelVal {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Closure(b) => b.hash(state),
+            BoolV(b) => b.hash(state),
+            NumV(n) => n.to_string().hash(state),
+            IntV(i) => i.hash(state),
+            Rational(f) => f.hash(state),
+            CharV(c) => c.hash(state),
+            VectorV(v) => v.hash(state),
+            Void => {}
+            StringV(s) => s.hash(state),
+            FuncV(s) => s.hash(state),
+            SymbolV(sym) => sym.hash(state),
+            #[cfg(feature = "custom-hash")]
+            Custom(v) => match v.read().try_as_dyn_hash() {
+                Some(x) => x.dyn_hash(state),
+                _ => Gc::as_ptr(v).hash(state),
+            },
+            #[cfg(not(feature = "custom-hash"))]
+            Custom(v) => Gc::as_ptr(v).hash(state),
+            HashMapV(hm) => hm.hash(state),
+            HashSetV(hs) => hs.hash(state),
+            CustomStruct(s) => s.hash(state),
+            PortV(port) => port.hash(state),
+            IterV(s) => s.hash(state),
+            ReducerV(r) => r.hash(state),
+            FutureFunc(fun) => crate::gc::Shared::as_ptr(fun).hash(state),
+            FutureV(f) => Gc::as_ptr(f).hash(state),
+            StreamV(s) => Gc::as_ptr(s).hash(state),
+            BoxedFunction(fun) => Gc::as_ptr(fun).hash(state),
+            ContinuationFunction(cont) => StandardShared::as_ptr(&cont.inner).hash(state),
+            ListV(l) => l.hash(state),
+            Pair(p) => (**p).hash(state),
+            MutFunc(fun) => fun.hash(state),
+            BuiltIn(fun) => fun.hash(state),
+            MutableVector(vec) => vec.get().hash(state),
+            BoxedIterator(iter) => Gc::as_ptr(iter).hash(state),
+            SyntaxObject(s) => s.raw.hash(state),
+            Boxed(val) => val.read().hash(state),
+            HeapAllocated(v) => v.get().hash(state),
+            Reference(v) => Gc::as_ptr(v).hash(state),
+            BigNum(n) => n.hash(state),
+            BigRational(f) => f.hash(state),
+            Complex(x) => x.hash(state),
+            ByteVector(v) => (*v).hash(state),
+        }
+    }
+}
+
+impl SteelVal {
+    #[inline(always)]
+    pub fn is_truthy(&self) -> bool {
+        match &self {
+            SteelVal::BoolV(false) => false,
+            _ => true,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_future(&self) -> bool {
+        matches!(self, SteelVal::FutureV(_))
+    }
+
+    pub fn is_function(&self) -> bool {
+        matches!(
+            self,
+            BoxedFunction(_)
+                | Closure(_)
+                | FuncV(_)
+                // | ContractedFunction(_)
+                | BuiltIn(_)
+                | MutFunc(_)
+        )
+    }
+
+    // pub fn is_contract(&self) -> bool {
+    //     matches!(self, Contract(_))
+    // }
+
+    pub fn empty_hashmap() -> SteelVal {
+        SteelVal::HashMapV(Gc::new(HashMap::new()).into())
+    }
+}
+
+impl SteelVal {
+    // pub fn res_iterator
+
+    pub fn list_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> core::result::Result<&List<SteelVal>, E> {
+        match self {
+            Self::ListV(v) => Ok(v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn list(&self) -> Option<&List<SteelVal>> {
+        match self {
+            Self::ListV(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub fn pair(&self) -> Option<&Gc<crate::values::lists::Pair>> {
+        match self {
+            Self::Pair(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn bool_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<bool, E> {
+        match self {
+            Self::BoolV(v) => Ok(*v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn int_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<isize, E> {
+        match self {
+            Self::IntV(v) => Ok(*v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn num_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<f64, E> {
+        match self {
+            Self::NumV(v) => Ok(*v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn char_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<char, E> {
+        match self {
+            Self::CharV(v) => Ok(*v),
+            _ => Err(err()),
+        }
+    }
+
+    /// Vector does copy on the value to return
+    pub fn vector_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> core::result::Result<Vector<SteelVal>, E> {
+        match self {
+            Self::VectorV(v) => Ok(v.0.unwrap()),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn void_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<(), E> {
+        match self {
+            Self::Void => Ok(()),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn string_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<&str, E> {
+        match self {
+            Self::StringV(v) => Ok(v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn func_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> core::result::Result<&FunctionSignature, E> {
+        match self {
+            Self::FuncV(v) => Ok(v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn boxed_func_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> core::result::Result<&BoxedDynFunction, E> {
+        match self {
+            Self::BoxedFunction(v) => Ok(v),
+            _ => Err(err()),
+        }
+    }
+
+    // pub fn contract_or_else<E, F: FnOnce() -> E>(
+    //     &self,
+    //     err: F,
+    // ) -> core::result::Result<Gc<ContractType>, E> {
+    //     match self {
+    //         Self::Contract(c) => Ok(c.clone()),
+    //         _ => Err(err()),
+    //     }
+    // }
+
+    pub fn closure_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> core::result::Result<Gc<ByteCodeLambda>, E> {
+        match self {
+            Self::Closure(c) => Ok(c.clone()),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn symbol_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<&str, E> {
+        match self {
+            Self::SymbolV(v) => Ok(v),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn clone_symbol_or_else<E, F: FnOnce() -> E>(
+        &self,
+        err: F,
+    ) -> core::result::Result<String, E> {
+        match self {
+            Self::SymbolV(v) => Ok(v.to_string()),
+            _ => Err(err()),
+        }
+    }
+
+    pub fn as_isize(&self) -> Option<isize> {
+        match self {
+            Self::IntV(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    pub fn as_usize(&self) -> Option<usize> {
+        self.as_isize()
+            .and_then(|x| if x >= 0 { Some(x as usize) } else { None })
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::BoolV(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_future(&self) -> Option<Shared<BoxedFutureResult>> {
+        match self {
+            Self::FutureV(v) => Some(v.clone().unwrap().into_shared()),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&SteelString> {
+        match self {
+            Self::StringV(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_symbol(&self) -> Option<&SteelString> {
+        match self {
+            Self::SymbolV(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_syntax_object(&self) -> Option<&Syntax> {
+        match self {
+            Self::SyntaxObject(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    // pub fn custom_or_else<E, F: FnOnce() -> E>(
+    //     &self,
+    //     err: F,
+    // ) -> core::result::Result<&Box<dyn CustomType>, E> {
+    //     match self {
+    //         Self::Custom(v) => Ok(&v),
+    //         _ => Err(err()),
+    //     }
+    // }
+
+    // pub fn struct_or_else<E, F: FnOnce() -> E>(
+    //     &self,
+    //     err: F,
+    // ) -> core::result::Result<&SteelStruct, E> {
+    //     match self {
+    //         Self::StructV(v) => Ok(v),
+    //         _ => Err(err()),
+    //     }
+    // }
+
+    pub fn closure_arity(&self) -> Option<usize> {
+        if let SteelVal::Closure(c) = self {
+            Some(c.arity())
+        } else {
+            None
+        }
+    }
+}
+
+impl SteelVal {
+    pub const INT_ZERO: SteelVal = SteelVal::IntV(0);
+    pub const INT_ONE: SteelVal = SteelVal::IntV(1);
+    pub const INT_TWO: SteelVal = SteelVal::IntV(2);
+}
+
+impl Eq for SteelVal {}
+
+fn integer_float_equality(int: isize, float: f64) -> bool {
+    let converted = float as isize;
+
+    if float == converted as f64 {
+        int == converted
+    } else {
+        false
+    }
+}
+
+fn bignum_float_equality(bigint: &Gc<BigInt>, float: f64) -> bool {
+    if float.fract() == 0.0 {
+        if let Some(promoted) = bigint.to_f64() {
+            promoted == float
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+#[inline(always)]
+#[steel_derive::function(name = "=", constant = true)]
+pub fn number_equality(left: &SteelVal, right: &SteelVal) -> Result<SteelVal> {
+    let result = match (left, right) {
+        (IntV(l), IntV(r)) => l == r,
+        (NumV(l), NumV(r)) => l == r,
+        (IntV(l), NumV(r)) | (NumV(r), IntV(l)) => integer_float_equality(*l, *r),
+        (Rational(l), Rational(r)) => l == r,
+        (Rational(l), NumV(r)) | (NumV(r), Rational(l)) => l.to_f64().unwrap() == *r,
+        (BigNum(l), BigNum(r)) => l == r,
+        (BigNum(l), NumV(r)) | (NumV(r), BigNum(l)) => bignum_float_equality(l, *r),
+        (BigRational(l), BigRational(r)) => l == r,
+        (BigRational(l), NumV(r)) | (NumV(r), BigRational(l)) => l.to_f64().unwrap() == *r,
+        // The below should be impossible as integers/bignums freely convert into each
+        // other. Similar for int/bignum/rational/bigrational.
+        (Rational(_), IntV(_))
+        | (IntV(_), Rational(_))
+        | (Rational(_), BigNum(_))
+        | (BigNum(_), Rational(_))
+        | (Rational(_), BigRational(_))
+        | (BigRational(_), Rational(_)) => false,
+        (BigRational(_), IntV(_))
+        | (IntV(_), BigRational(_))
+        | (BigRational(_), BigNum(_))
+        | (BigNum(_), BigRational(_)) => false,
+        (IntV(_), BigNum(_)) | (BigNum(_), IntV(_)) => false,
+        (Complex(x), Complex(y)) => {
+            number_equality(&x.re, &y.re)? == BoolV(true)
+                && number_equality(&x.im, &y.re)? == BoolV(true)
+        }
+        (Complex(_), _) | (_, Complex(_)) => false,
+        _ => stop!(TypeMismatch => "= expects two numbers, found: {:?} and {:?}", left, right),
+    };
+    Ok(BoolV(result))
+}
+
+impl PartialOrd for SteelVal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // TODO: Attempt to avoid converting to f64 for cases below as it may lead to precision loss
+        // at tiny and large values.
+        match (self, other) {
+            // Comparison of matching `SteelVal` variants:
+            (IntV(x), IntV(y)) => x.partial_cmp(y),
+            (BigNum(x), BigNum(y)) => x.partial_cmp(y),
+            (Rational(x), Rational(y)) => x.partial_cmp(y),
+            (BigRational(x), BigRational(y)) => x.partial_cmp(y),
+            (NumV(x), NumV(y)) => x.partial_cmp(y),
+            (StringV(s), StringV(o)) => s.partial_cmp(o),
+            (CharV(l), CharV(r)) => l.partial_cmp(r),
+
+            // Comparison of `IntV`, means promoting to the rhs type
+            (IntV(x), BigNum(y)) => x
+                .to_bigint()
+                .expect("integers are representable by bigint")
+                .partial_cmp(y),
+            (IntV(x), Rational(y)) => {
+                // Since we have platform-dependent type for rational conditional compilation is required to find
+                // the common ground
+                #[cfg(target_pointer_width = "32")]
+                {
+                    let x_rational = num_rational::Rational32::new_raw(*x as i32, 1);
+                    x_rational.partial_cmp(y)
+                }
+                #[cfg(target_pointer_width = "64")]
+                {
+                    let x_rational = num_rational::Rational64::new_raw(*x as i64, 1);
+                    x_rational.partial_cmp(&num_rational::Rational64::new_raw(
+                        *y.numer() as i64,
+                        *y.denom() as i64,
+                    ))
+                }
+            }
+            (IntV(x), BigRational(y)) => {
+                let x_rational = BigRational::from_integer(
+                    x.to_bigint().expect("integers are representable by bigint"),
+                );
+                x_rational.partial_cmp(y)
+            }
+            (IntV(x), NumV(y)) => (*x as f64).partial_cmp(y),
+
+            // BigNum comparisons means promoting to BigInt for integers, BigRational for ratios,
+            // or Decimal otherwise
+            (BigNum(x), IntV(y)) => x
+                .as_ref()
+                .partial_cmp(&y.to_bigint().expect("integers are representable by bigint")),
+            (BigNum(x), Rational(y)) => {
+                let x_big_rational = BigRational::from_integer(x.unwrap());
+                let y_big_rational = BigRational::new_raw(
+                    y.numer()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                    y.denom()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                );
+                x_big_rational.partial_cmp(&y_big_rational)
+            }
+            (BigNum(x), BigRational(y)) => {
+                let x_big_rational = BigRational::from_integer(x.unwrap());
+                x_big_rational.partial_cmp(y)
+            }
+            (BigNum(x), NumV(y)) => {
+                let x_decimal = BigDecimal::new(x.unwrap(), 0);
+                let y_decimal_opt = BigDecimal::from_f64(*y);
+                y_decimal_opt.and_then(|y_decimal| x_decimal.partial_cmp(&y_decimal))
+            }
+
+            // Rationals require rationals, regular or bigger versions; for float it will be divided to float as well
+            (Rational(x), IntV(y)) => {
+                // Same as before, but opposite direction
+                #[cfg(target_pointer_width = "32")]
+                {
+                    let y_rational = num_rational::Rational32::new_raw(*y as i32, 1);
+                    x.partial_cmp(&y_rational)
+                }
+                #[cfg(target_pointer_width = "64")]
+                {
+                    let y_rational = num_rational::Rational64::new_raw(*y as i64, 1);
+                    num_rational::Rational64::new_raw(*x.numer() as i64, *x.denom() as i64)
+                        .partial_cmp(&y_rational)
+                }
+            }
+            (Rational(x), BigNum(y)) => {
+                let x_big_rational = BigRational::new_raw(
+                    x.numer()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                    x.denom()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                );
+                let y_big_rational = BigRational::from_integer(y.unwrap());
+                x_big_rational.partial_cmp(&y_big_rational)
+            }
+            (Rational(x), BigRational(y)) => {
+                let x_big_rational = BigRational::new_raw(
+                    x.numer()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                    x.denom()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                );
+                x_big_rational.partial_cmp(y)
+            }
+            (Rational(x), NumV(y)) => (*x.numer() as f64 / *x.denom() as f64).partial_cmp(y),
+
+            // The most capacious set, but need to cover float case with BigDecimal anyways
+            (BigRational(x), IntV(y)) => {
+                let y_rational = BigRational::from_integer(
+                    y.to_bigint().expect("integers are representable by bigint"),
+                );
+                x.as_ref().partial_cmp(&y_rational)
+            }
+            (BigRational(x), BigNum(y)) => {
+                let y_big_rational = BigRational::from_integer(y.unwrap());
+                x.as_ref().partial_cmp(&y_big_rational)
+            }
+            (BigRational(x), Rational(y)) => {
+                let y_big_rational = BigRational::new_raw(
+                    y.numer()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                    y.denom()
+                        .to_bigint()
+                        .expect("integers are representable by bigint"),
+                );
+                x.as_ref().partial_cmp(&y_big_rational)
+            }
+            (BigRational(x), NumV(y)) => {
+                let x_decimal =
+                    BigDecimal::new(x.numer().clone(), 0) / BigDecimal::new(x.denom().clone(), 0);
+                let y_decimal_opt = BigDecimal::from_f64(*y);
+                y_decimal_opt.and_then(|y_decimal| x_decimal.partial_cmp(&y_decimal))
+            }
+
+            // The opposite of all float cases above
+            (NumV(x), IntV(y)) => x.partial_cmp(&(*y as f64)),
+            (NumV(x), BigNum(y)) => {
+                let x_decimal_opt = BigDecimal::from_f64(*x);
+                let y_decimal = BigDecimal::new(y.unwrap(), 0);
+                x_decimal_opt.and_then(|x_decimal| x_decimal.partial_cmp(&y_decimal))
+            }
+            (NumV(x), Rational(y)) => x.partial_cmp(&(*y.numer() as f64 / *y.denom() as f64)),
+            (NumV(x), BigRational(y)) => {
+                let x_decimal_opt = BigDecimal::from_f64(*x);
+                let y_decimal =
+                    BigDecimal::new(y.numer().clone(), 0) / BigDecimal::new(y.denom().clone(), 0);
+                x_decimal_opt.and_then(|x_decimal| x_decimal.partial_cmp(&y_decimal))
+            }
+
+            (l, r) => {
+                // All real numbers (not complex) should have order defined.
+                debug_assert!(
+                    !(realp(l) && realp(r)),
+                    "Numbers {l:?} and {r:?} should implement partial_cmp"
+                );
+                // Unimplemented for other types
+                None
+            }
+        }
+    }
+}
+
+pub(crate) struct SteelValDisplay<'a>(pub(crate) &'a SteelVal);
+
+impl<'a> fmt::Display for SteelValDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        CycleDetector::detect_and_display_cycles(self.0, f, false)
+    }
+}
+
+impl fmt::Display for SteelVal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        CycleDetector::detect_and_display_cycles(self, f, true)
+    }
+}
+
+impl fmt::Debug for SteelVal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // at the top level, print a ' if we are
+        // trying to print a symbol or list
+        match self {
+            SymbolV(_) | ListV(_) | VectorV(_) => write!(f, "'")?,
+            _ => (),
+        };
+        // display_helper(self, f)
+
+        CycleDetector::detect_and_display_cycles(self, f, true)
+    }
+}
+
+#[cfg(test)]
+mod or_else_tests {
+
+    use super::*;
+
+    #[cfg(all(feature = "sync", not(feature = "imbl")))]
+    use im::vector;
+
+    #[cfg(all(feature = "sync", feature = "imbl"))]
+    use steel_imbl::generic_vector as vector;
+
+    #[cfg(not(feature = "sync"))]
+    use im_rc::vector;
+
+    #[test]
+    fn bool_or_else_test_good() {
+        let input = SteelVal::BoolV(true);
+        assert_eq!(input.bool_or_else(throw!(Generic => "test")).unwrap(), true);
+    }
+
+    #[test]
+    fn bool_or_else_test_bad() {
+        let input = SteelVal::CharV('f');
+        assert!(input.bool_or_else(throw!(Generic => "test")).is_err());
+    }
+
+    #[test]
+    fn num_or_else_test_good() {
+        let input = SteelVal::NumV(10.0);
+        assert_eq!(input.num_or_else(throw!(Generic => "test")).unwrap(), 10.0);
+    }
+
+    #[test]
+    fn num_or_else_test_bad() {
+        let input = SteelVal::CharV('f');
+        assert!(input.num_or_else(throw!(Generic => "test")).is_err());
+    }
+
+    #[test]
+    fn char_or_else_test_good() {
+        let input = SteelVal::CharV('f');
+        assert_eq!(input.char_or_else(throw!(Generic => "test")).unwrap(), 'f');
+    }
+
+    #[test]
+    fn char_or_else_test_bad() {
+        let input = SteelVal::NumV(10.0);
+        assert!(input.char_or_else(throw!(Generic => "test")).is_err());
+    }
+
+    #[test]
+    fn vector_or_else_test_good() {
+        let input: SteelVal = vector![SteelVal::IntV(1)].into();
+        assert_eq!(
+            input.vector_or_else(throw!(Generic => "test")).unwrap(),
+            vector![SteelVal::IntV(1)]
+        );
+    }
+
+    #[test]
+    fn vector_or_else_bad() {
+        let input = SteelVal::CharV('f');
+        assert!(input.vector_or_else(throw!(Generic => "test")).is_err());
+    }
+
+    #[test]
+    fn void_or_else_test_good() {
+        let input = SteelVal::Void;
+        assert_eq!(input.void_or_else(throw!(Generic => "test")).unwrap(), ())
+    }
+
+    #[test]
+    fn void_or_else_test_bad() {
+        let input = SteelVal::StringV("foo".into());
+        assert!(input.void_or_else(throw!(Generic => "test")).is_err());
+    }
+
+    #[test]
+    fn string_or_else_test_good() {
+        let input = SteelVal::StringV("foo".into());
+        assert_eq!(
+            input.string_or_else(throw!(Generic => "test")).unwrap(),
+            "foo".to_string()
+        );
+    }
+
+    #[test]
+    fn string_or_else_test_bad() {
+        let input = SteelVal::Void;
+        assert!(input.string_or_else(throw!(Generic => "test")).is_err())
+    }
+
+    #[test]
+    fn symbol_or_else_test_good() {
+        let input = SteelVal::SymbolV("foo".into());
+        assert_eq!(
+            input.symbol_or_else(throw!(Generic => "test")).unwrap(),
+            "foo".to_string()
+        );
+    }
+
+    #[test]
+    fn symbol_or_else_test_bad() {
+        let input = SteelVal::Void;
+        assert!(input.symbol_or_else(throw!(Generic => "test")).is_err())
+    }
+
+    #[test]
+    fn num_and_char_are_not_ordered() {
+        assert_eq!(SteelVal::IntV(0).partial_cmp(&SteelVal::CharV('0')), None);
+        assert_eq!(SteelVal::NumV(0.0).partial_cmp(&SteelVal::CharV('0')), None);
+        assert_eq!(
+            SteelVal::BigNum(Gc::new(BigInt::default())).partial_cmp(&SteelVal::CharV('0')),
+            None
+        );
+    }
+
+    #[test]
+    fn number_cmp() {
+        let less_cases = [
+            (SteelVal::IntV(-10), SteelVal::IntV(1)),
+            (
+                SteelVal::IntV(-10),
+                SteelVal::BigNum(Gc::new(BigInt::from(1))),
+            ),
+            (SteelVal::NumV(-10.0), SteelVal::IntV(1)),
+            (SteelVal::IntV(-10), SteelVal::NumV(1.0)),
+            (
+                SteelVal::BigNum(Gc::new(BigInt::from(-10))),
+                SteelVal::BigNum(Gc::new(BigInt::from(1))),
+            ),
+            (
+                SteelVal::NumV(-10.0),
+                SteelVal::BigNum(Gc::new(BigInt::from(1))),
+            ),
+        ];
+        for (l, r) in less_cases {
+            assert_eq!(l.partial_cmp(&r), Some(Ordering::Less));
+            assert_eq!(r.partial_cmp(&l), Some(Ordering::Greater));
+        }
+        let equal_cases = [
+            SteelVal::IntV(-10),
+            SteelVal::NumV(-10.0),
+            SteelVal::BigNum(Gc::new(BigInt::from(-10))),
+            // Added to test that the number is equal even if it points to a different object.
+            SteelVal::BigNum(Gc::new(BigInt::from(-10))),
+        ]
+        .into_iter();
+        for (l, r) in equal_cases.clone().zip(equal_cases.clone()) {
+            assert_eq!(l.partial_cmp(&r), Some(Ordering::Equal));
+        }
+    }
+}

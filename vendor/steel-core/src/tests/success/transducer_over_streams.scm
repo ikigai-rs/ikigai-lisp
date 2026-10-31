@@ -1,0 +1,5 @@
+(define (integers n)
+        (stream-cons n (lambda () (integers (+ 1 n)))))
+(define result (transduce (integers 0) (taking 15) (into-list)))
+(define expected '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14))
+(assert! (equal? result expected))
