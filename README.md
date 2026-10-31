@@ -334,6 +334,13 @@ suite cannot hold are pinned there by hand:
   cap-gated resource under a capability that may run Lisp but holds no grant on
   that resource comes out as that resource's own `Denied`, on all three doors.
 
+## Accessibility
+
+What this crate writes that people read (a program's value, its refusals and its builtins'
+errors), which messages are Steel's and pass through unchanged, the rules it follows and the
+known limitations are in [ACCESSIBILITY.md](ACCESSIBILITY.md). Report a barrier with an issue
+labeled `accessibility`.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your option.
