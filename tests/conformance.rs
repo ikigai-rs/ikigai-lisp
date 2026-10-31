@@ -63,6 +63,17 @@
 //! [`the_composed_sign_doors_refuse_a_missing_input_typed`] holds the five refusals
 //! by their evidence rather than by the absence of a finding.
 //!
+//! ## BODY-INPUTS: one waiver, sign's own, under this Ed25519 key
+//!
+//! Since sign 0.4.2 (ledger #2590) `sign` declares `in` and `content` `reads_body`, so
+//! BODY-INPUTS (conformance 0.12.0) feeds each a one-shot attached body. Under an
+//! Ed25519 key `sign` refuses a one-shot `in` — typed `InvalidArgument` naming
+//! `urn:stream:spill` — because RFC 8032 reads the message twice and sign will not hold
+//! it whole. That refusal is sign's design since 0.4.1, not a regression: 0.4.2 only
+//! made the declaration that lets the suite see it. The fixture keypair is Ed25519, so
+//! [`suite`] carries the same waiver sign's own suite does under Ed25519, and
+//! [`conforms`] asserts it is not idle.
+//!
 //! NAMES runs: every id is kebab-case.
 
 use std::sync::Arc;
@@ -266,9 +277,23 @@ fn lisp() -> Capability {
 /// where the suite's `x` is not a program, the signed graph where its `x` is not a
 /// signature, and the sign endpoints' own fixtures. No `pure`, no `cacheable` on
 /// any lisp door; the two sign results are held to the cache over this threaded
-/// keystore, as their own suite holds them. No waiver on any door.
+/// keystore, as their own suite holds them. One waiver, sign's own: BODY-INPUTS on
+/// `sign` under this Ed25519 key (the file docs say why).
 fn suite(graph: &str, space: Arc<EndpointSpace>, store: Arc<MemoryContentStore>) -> Suite {
     Suite::new()
+        // Ed25519 signs in two passes over the message (RFC 8032: once for the nonce,
+        // once for the challenge), so `sign` refuses a one-shot attached `in` with a
+        // typed InvalidArgument naming `urn:stream:spill` rather than holding it whole
+        // (sign ledger #2285). sign's own suite waives exactly this under Ed25519 and
+        // holds `sign` to all four forms under ES256. [`conforms`] asserts the waiver
+        // is not idle, so it goes red the day sign accepts a one-shot `in`.
+        .opt_out_check(
+            SIGN,
+            Check::BodyInputs,
+            "an Ed25519 key signs in two passes over the message, so a one-shot attached \
+             `in` is refused (typed InvalidArgument naming urn:stream:spill) rather than \
+             held whole; ikigai-sign's own ES256 walk compares all four forms",
+        )
         .body_space(space)
         .body_input_store(store)
         .namespace(ikigai_sign::SIG_NS)
@@ -336,6 +361,8 @@ fn conforms() {
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
     assert_shape(&report);
+    // The one waiver (sign's BODY-INPUTS under Ed25519) still suppresses something.
+    assert!(report.idle_waivers().is_empty(), "{report}");
     assert_eq!(
         ikigai_core::space_iri("lisp").as_str(),
         ikigai_lisp::SPACE_ID
