@@ -298,6 +298,21 @@ are named. Both still accept `content` from a caller that sends it by name (a re
 `urn:decide:accept`), but do not declare it: a second optional input leaves the REPL
 engine two places to put a value and it refuses the line (`tests/pipeline.rs`).
 
+### One stderr line from Steel on a fresh account
+
+On an account whose `~/.local/share` does not exist, the first evaluation in a process
+prints one line to stderr:
+
+```text
+Unable to create steel home directory "/home/svc/.local/share/steel": No such file or directory (os error 2)
+```
+
+It is harmless: no program can read Steel's home directory (path `require` and native
+modules are refused by the sandbox), and evaluation goes on. It comes from `steel-core`,
+which creates that directory with `create_dir` rather than `create_dir_all`, and this
+crate cannot turn it off. To silence it on a host, set `STEEL_HOME` in the service's
+environment to a directory that exists, or create `~/.local/share` for the account.
+
 Native-only: the synchronous Steel engine reaches the async kernel through core's
 `Invocation::scope_sync` bridge (real threads), so there is no wasm face yet. Builtin-set filtering by capability
 (binding only the verbs a capability authorizes) is a later slice.
