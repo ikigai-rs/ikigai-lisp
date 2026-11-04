@@ -21,7 +21,9 @@ name = "ikigai-lisp"
 # Breaking for consumers: public core types now come from the 0.2 line.
 # 0.4.1 (ledger #2489): `sort` (native or Lisp comparator) and `string-split` in the sandbox;
 # 24 allowlist entries, all evaluation-local, none reaching the host. Additive: a patch.
-version = "0.4.1"
+# 0.5.0 (ledger #3066, cascade epic #2975): adopt core 0.3, the scoped content store (ledger #2965).
+# Breaking for consumers: public core types now come from the 0.3 line.
+version = "0.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -33,16 +35,17 @@ keywords = ["ikigai", "roc", "lisp", "scheme", "capability"]
 categories = ["compilers", "caching"]
 
 [dependencies]
-# 0.2.0 is the streams release (ledger #2261). The old 0.1 pin meant <0.2.0
-# under 0.x rules. This caret floor admits 0.2.x so hosts share one core.
-ikigai-core = "0.2.0"
+# 0.3.0 is the scoped content store (ledger #2965): held content is scoped to whoever
+# delivered it, and ContentStore::put/put_replay are root-only. The old 0.2 pin meant <0.3.0
+# under 0.x rules. This caret floor admits 0.3.x so hosts share one core.
+ikigai-core = "0.3.0"
 async-trait = "0.1"
 # The neutral s-expression foundation — owns the pure `sexpr_to_sparql` (query) and
 # `sexpr_to_turtle` (graph) compilers over its language-agnostic `Sexpr` datum (single
 # source of truth). The `(sparql-select …)` and `(graph …)` builtins adapt Steel's
 # `SteelVal` into `Sexpr` and call these, rather than carrying an inline compiler.
-# 0.3.0 moves the compilers onto the streams core 0.2 line.
-ikigai-sexpr = "0.3.0"
+# 0.4.0 moves the compilers onto the core 0.3 line.
+ikigai-sexpr = "0.4.0"
 # The Scheme engine; its builtins are the kernel verbs. 0.8 is the current
 # embedding API (`Engine::run`, `register_fn`).
 # PINNED EXACTLY (ledger #921): the sandbox's allowlist is DERIVED from Steel's compiled
@@ -59,22 +62,21 @@ steel-core = "=0.8.3"
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`), including the composed
-# signing doors. 0.12.0 also enables BODIES and BODY-INPUTS by default.
-ikigai-conformance = "0.12.0"
-# The real signing module verifies stored programs through the kernel. 0.4.1
-# requires core 0.2.1, admitted by our 0.2.0 caret floor. 0.4.2 declares `in`
-# `reads_body` (ledger #2590), which the conformance suite's Ed25519 BODY-INPUTS
-# waiver depends on (`tests/conformance.rs`, ledger #2726).
-ikigai-sign = "0.4.2"
+# signing doors. BODIES and BODY-INPUTS are on by default since 0.12.0; 0.14.0 is its core 0.3 release.
+ikigai-conformance = "0.14.0"
+# The real signing module verifies stored programs through the kernel. It declares `in`
+# `reads_body` since 0.4.2 (ledger #2590), which the conformance suite's Ed25519 BODY-INPUTS
+# waiver depends on (`tests/conformance.rs`, ledger #2726). 0.5.0 is its core 0.3 release.
+ikigai-sign = "0.5.0"
 # The wall-clock Timeout overlay proves the wire-eval governor end to end.
-ikigai-throttle = "0.3.0"
+ikigai-throttle = "0.4.0"
 # A real sibling proves verb-as-function across a module boundary.
-ikigai-fn = "0.7.0"
+ikigai-fn = "0.10.0"
 # The real SPARQL engine runs the compiled-query oracle end to end.
-ikigai-sparql = "0.3.1"
+ikigai-sparql = "0.5.0"
 # The real REPL engine proves positional and piped routing (`tests/pipeline.rs`).
-# All these released siblings share core 0.2 with the library.
-ikigai-engine = "0.2.0"
+# All these released siblings share core 0.3 with the library.
+ikigai-engine = "0.3.0"
 # The engine reads each contract as `Meta as=application/json`; the test kernel must answer,
 # or the engine fails OPEN and routes every value to `in`, proving nothing.
 serde_json = "1"
