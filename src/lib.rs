@@ -571,11 +571,12 @@ async fn run_eval(
         }
     }
 
-    // Check out a warm worker FIRST, on the async side (or spawn one, within the
-    // worker ceiling — at the ceiling this is a typed transient refusal, the
-    // wire-eval compute governor's thread bound). It must happen before entering
-    // the sync scope: the refusal is synchronous and immediate, so a nested eval
-    // probing it with a no-parking poll sees `Unavailable`, never `Pending`.
+    // Admit the eval and check out a warm worker FIRST, on the async side. A root at
+    // the ceiling is a typed transient refusal (the wire-eval compute governor's
+    // bound); an eval nested inside another rides on its root's admission. It must
+    // happen before entering the sync scope: the refusal is synchronous and immediate,
+    // so a caller probing it with a no-parking poll sees `Unavailable`, never `Pending`.
+    let admission = admit(inv)?;
     let worker = checkout_worker()?;
 
     // If this future is dropped before the program finishes — a fired `Timeout`
@@ -597,32 +598,40 @@ async fn run_eval(
     // blocking dependency with its own overlay. When the overlay fires, dropping this
     // future interrupts the program (above) and fails the worker's pending
     // `issuer.issue` — a program cannot catch its way past either.
-    let (worker, outcome) = inv
-        .scope_sync(move |issuer| {
-            let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<EvalOutcome>(1);
-            // A send failure means the pooled worker's thread already exited —
-            // surface it exactly like a mid-run death (below), and let it go.
-            if worker
-                .send(EvalJob {
-                    src,
-                    input,
-                    issuer,
-                    result_tx,
-                    job,
-                })
-                .is_err()
-            {
-                return (None, EvalOutcome::worker_died());
-            }
-            // A live worker sends exactly one outcome, then is safe to reuse. A worker
-            // that died mid-run drops `result_tx`, so the recv fails — surface it and
-            // do not re-pool.
-            match result_rx.recv() {
-                Ok(outcome) => (Some(worker), outcome),
-                Err(_) => (None, EvalOutcome::worker_died()),
-            }
-        })
-        .await?;
+    // The scope is polled with this eval's root ambient, so an eval its sub-requests
+    // reach is admitted as nested inside it ([`admit`]).
+    let scope = inv.scope_sync(move |issuer| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<EvalOutcome>(1);
+        // A send failure means the pooled worker's thread already exited —
+        // surface it exactly like a mid-run death (below), and let it go.
+        if worker
+            .send(EvalJob {
+                src,
+                input,
+                issuer,
+                result_tx,
+                job,
+            })
+            .is_err()
+        {
+            return (None, EvalOutcome::worker_died());
+        }
+        // A live worker sends exactly one outcome, then is safe to reuse. A worker
+        // that died mid-run drops `result_tx`, so the recv fails — surface it and
+        // do not re-pool.
+        match result_rx.recv() {
+            Ok(outcome) => (Some(worker), outcome),
+            Err(_) => (None, EvalOutcome::worker_died()),
+        }
+    });
+    let (worker, outcome) = InRoot {
+        root: admission.root(),
+        inner: Box::pin(scope),
+    }
+    .await?;
+    // Release the admission before re-pooling, so a root's slot is free by the time
+    // its worker is idle again.
+    drop(admission);
 
     // Re-pool a worker that completed cleanly (even when the PROGRAM errored —
     // that is a clean completion; only a dead worker is dropped).
@@ -1099,39 +1108,98 @@ thread_local! {
 /// [`worker_ceiling`], the wire-eval compute governor's thread bound.
 static POOL: OnceLock<Mutex<Vec<Sender<EvalJob>>>> = OnceLock::new();
 
-/// Live eval workers, idle AND busy — the count the ceiling bounds. Incremented
-/// at spawn; decremented when a worker thread exits (its guard drops), so a
-/// panicked-and-not-re-pooled worker releases its slot.
-static LIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Root evaluations in flight: the count the ceiling bounds. A root is an eval no other
+/// eval is waiting on (a host's request, a peer's, a REPL's); the evals nested inside
+/// it ride on its admission ([`admit`]).
+static ROOT_EVALS: AtomicUsize = AtomicUsize::new(0);
 
-/// Ceiling on concurrently-live eval workers (threads). Before this bound an
-/// unanswerable burst — or a runaway spawning nested evals — grew a thread per
-/// eval without limit (the resource-exhaustion finding from the 2026-07-21
-/// review, and a hard prerequisite for serving eval over the wire). A host sets it
-/// with [`Limits::workers`] (it used to be an environment variable, #214); the
-/// default is machine-fitness — the host's available parallelism, floored at 8 — so
-/// ordinary concurrency (a scheduler pool, a parallel test run) fits while a runaway
-/// still meets a bound instead of a thread per eval.
+/// Ceiling on concurrent ROOT evaluations, and on the idle workers the pool keeps.
+/// Before this bound an unanswerable burst grew a thread per eval without limit (the
+/// resource-exhaustion finding from the 2026-07-21 review, and a hard prerequisite for
+/// serving eval over the wire). A host sets it with [`Limits::workers`] (it used to be
+/// an environment variable, #214); the default is machine-fitness — the host's
+/// available parallelism, floored at 8 — so ordinary concurrency (a scheduler pool, a
+/// parallel test run) fits while a burst still meets a bound instead of a thread per
+/// eval.
+///
+/// It bounds roots, not every eval (ledger #3458). When it bounded every live worker,
+/// a program that called itself held one worker per level and ran the pool dry before
+/// the kernel's depth budget was reached: it was refused as a busy pool (transient,
+/// "retry") instead of as too deep, and while it ran every unrelated eval on the host
+/// was refused too. A nested eval is bounded by its root instead: by the kernel's
+/// depth budget, and by [`MAX_NESTED_EVALS`] behind it.
 fn worker_ceiling() -> usize {
     limits().workers.max(1)
 }
 
-/// Take an idle worker, or spawn a fresh warm one **within the ceiling**. At the
-/// ceiling the refusal is a typed, transient [`Error::Unavailable`] — so a
-/// caller's Retry/CircuitBreaker overlays engage, and a saturated pool degrades
-/// loudly instead of growing threads without bound. NB a NESTED eval (a program
-/// whose sub-request resolves another `urn:lisp:eval`) holds its own worker
-/// while needing a second: at ceiling 1 that nests into this refusal rather
-/// than deadlocking — the typed refusal is the designed behavior.
-fn checkout_worker() -> Result<Sender<EvalJob>> {
-    let pool = POOL.get_or_init(|| Mutex::new(Vec::new()));
-    if let Some(worker) = pool.lock().unwrap().pop() {
-        return Ok(worker);
+/// The most evals one root may have nested inside it at once — a backstop behind the
+/// kernel's depth budget (`Kernel::with_max_depth`, default 64), which fires first on
+/// a default kernel: each nested eval is at least one level deeper than its parent.
+/// Past it, the nested eval is refused as too deep, as the kernel would refuse it.
+const MAX_NESTED_EVALS: usize = ikigai_core::DEFAULT_MAX_DEPTH as usize;
+
+/// What a root evaluation carries for the evals nested inside it.
+struct Root {
+    /// Evals nested inside this root that are running now.
+    nested: AtomicUsize,
+}
+
+thread_local! {
+    /// The root of the eval whose sub-requests THIS thread is serving right now. Set
+    /// only while [`InRoot`] polls an eval's sync scope — which is where that eval's
+    /// sub-requests are resolved — so an eval admitted while it is set is one the
+    /// polling eval is waiting on: nested inside it, by construction.
+    static AMBIENT_ROOT: RefCell<Option<Arc<Root>>> = const { RefCell::new(None) };
+}
+
+/// An eval's admission, released when its future completes or is dropped.
+enum Admission {
+    /// A root: holds one of the [`worker_ceiling`] slots.
+    Root(Arc<Root>),
+    /// Nested inside a running root: counted against that root alone.
+    Nested(Arc<Root>),
+}
+
+impl Admission {
+    fn root(&self) -> Arc<Root> {
+        match self {
+            Admission::Root(root) | Admission::Nested(root) => Arc::clone(root),
+        }
     }
-    // No idle worker: admit a new one only under the ceiling (CAS loop, so two
-    // racing checkouts can't both take the last slot).
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        match self {
+            Admission::Root(_) => ROOT_EVALS.fetch_sub(1, Ordering::AcqRel),
+            Admission::Nested(root) => root.nested.fetch_sub(1, Ordering::AcqRel),
+        };
+    }
+}
+
+/// Admit an eval. An eval issued from inside another (it is deeper than the host's
+/// request, and an eval's sync scope is resolving it on this thread) rides on that
+/// eval's root and never meets the ceiling, so one request's recursion cannot hold
+/// the pool: it meets the kernel's depth budget, permanent and typed, as designed. Any
+/// other eval is a root, and at the ceiling its refusal is a typed, transient
+/// [`Error::Unavailable`] — so a caller's Retry/CircuitBreaker overlays engage, and a
+/// saturated host degrades loudly instead of growing threads without bound.
+fn admit(inv: &Invocation<'_>) -> Result<Admission> {
+    let ambient = AMBIENT_ROOT.with(|slot| slot.borrow().clone());
+    if let (true, Some(root)) = (inv.depth() > 0, ambient) {
+        let nested = root.nested.fetch_add(1, Ordering::AcqRel) + 1;
+        let admission = Admission::Nested(root);
+        if nested > MAX_NESTED_EVALS {
+            return Err(Error::DepthExceeded {
+                depth: inv.depth(),
+                target: inv.request.target.clone(),
+            });
+        }
+        return Ok(admission);
+    }
+    // CAS loop, so two racing roots can't both take the last slot.
     let ceiling = worker_ceiling();
-    let mut live = LIVE_WORKERS.load(Ordering::Relaxed);
+    let mut live = ROOT_EVALS.load(Ordering::Relaxed);
     loop {
         if live >= ceiling {
             return Err(Error::Unavailable(format!(
@@ -1139,47 +1207,75 @@ fn checkout_worker() -> Result<Sender<EvalJob>> {
                  the host's ikigai-lisp Limits::workers)"
             )));
         }
-        match LIVE_WORKERS.compare_exchange_weak(
-            live,
-            live + 1,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
+        match ROOT_EVALS.compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(current) => live = current,
         }
     }
-    let (job_tx, job_rx) = std::sync::mpsc::channel::<EvalJob>();
-    // Release the ceiling slot when this worker thread exits for any reason (all
-    // senders dropped, or an unwinding panic) — the guard's Drop runs either way, so a
-    // dead worker never leaks its slot. Built here so a thread that fails to start
-    // releases it too.
-    struct Slot;
-    impl Drop for Slot {
-        fn drop(&mut self) {
-            LIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    Ok(Admission::Root(Arc::new(Root {
+        nested: AtomicUsize::new(0),
+    })))
+}
+
+/// An eval's sync-scope future, polled with its root as this thread's
+/// [`AMBIENT_ROOT`] — the previous one restored after every poll, so the marker never
+/// outlives the poll that set it.
+struct InRoot<F> {
+    root: Arc<Root>,
+    inner: F,
+}
+
+impl<F: std::future::Future + Unpin> std::future::Future for InRoot<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        struct Restore(Option<Arc<Root>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let previous = self.0.take();
+                AMBIENT_ROOT.with(|slot| *slot.borrow_mut() = previous);
+            }
         }
+        let this = &mut *self;
+        let previous = AMBIENT_ROOT.with(|slot| slot.borrow_mut().replace(Arc::clone(&this.root)));
+        let _restore = Restore(previous);
+        std::pin::Pin::new(&mut this.inner).poll(cx)
     }
-    let slot = Slot;
+}
+
+/// Take an idle worker, or spawn a fresh warm one. Admission ([`admit`]) has already
+/// bounded how many evals can be running; this only finds each one a thread.
+fn checkout_worker() -> Result<Sender<EvalJob>> {
+    let pool = POOL.get_or_init(|| Mutex::new(Vec::new()));
+    if let Some(worker) = pool.lock().unwrap().pop() {
+        return Ok(worker);
+    }
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<EvalJob>();
     // An explicit stack: Steel's front end recurses per level of nesting, and an
     // overflow aborts the process, so the stack is sized for the deepest input the
     // bounds admit (see `limits.rs`) rather than left at a spawned thread's 2 MiB.
     std::thread::Builder::new()
         .name("ikigai-lisp-eval".to_string())
         .stack_size(limits().worker_stack_bytes)
-        .spawn(move || {
-            let _slot = slot;
-            worker_loop(job_rx);
-        })
+        .spawn(move || worker_loop(job_rx))
         .map_err(|e| Error::Unavailable(format!("lisp: an eval worker failed to start: {e}")))?;
     Ok(job_tx)
 }
 
 /// Return a worker to the idle pool for reuse. Only ever called for a worker that
 /// completed a run cleanly (a panicked worker is dropped, not re-pooled).
+/// The pool keeps at most [`worker_ceiling`] idle workers; a worker past that (one a
+/// deep recursion needed) is let go, and its thread exits.
 fn check_in_worker(worker: Sender<EvalJob>) {
     if let Some(pool) = POOL.get() {
-        pool.lock().unwrap().push(worker);
+        let mut idle = pool.lock().unwrap();
+        if idle.len() < worker_ceiling() {
+            idle.push(worker);
+        }
     }
 }
 

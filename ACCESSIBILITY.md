@@ -67,7 +67,8 @@ Not this repository's, though it passes them on:
   `an_identifier_never_defined_also_explains_the_isolation`, and `tests/isolation.rs`'s
   `a_name_from_an_earlier_eval_is_unbound`, pin the isolation hint and the name.
 - `tests/bounds.rs` pins that each bound's refusal names the bound; `tests/worker_ceiling.rs`
-  that the busy refusal names `Limits::workers`; `tests/minors.rs` the missing program, the
+  that the busy refusal names `Limits::workers`; `tests/self_call.rs` that a program calling
+  itself is refused as too deep (`DepthExceeded`), never as busy; `tests/minors.rs` the missing program, the
   undeclared verb and the 64-bit range; `tests/read_carryover.rs` the unterminated `read`;
   `tests/signed_run.rs` the rejected signature and the untrusted key.
 - `tests/retype.rs` pins that an uncaught error from a resource keeps its type and text, and
