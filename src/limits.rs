@@ -28,9 +28,13 @@ use steel::parser::tokens::TokenType;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Limits {
-    /// The most eval worker threads alive at once, busy or idle. At the ceiling a new
-    /// eval is refused with a transient `Unavailable`. Default: the host's available
-    /// parallelism, at least 8.
+    /// The most evaluations in flight at once, and the most idle worker threads kept.
+    /// It counts root evals: an eval nested inside another (a program that sources an
+    /// eval or another program, itself included) rides on the eval it is nested in
+    /// and is bounded by the kernel's depth budget instead, so one request's recursion
+    /// cannot hold the pool (ledger #3458). At the ceiling a new root eval is refused
+    /// with a transient `Unavailable`. Default: the host's available parallelism, at
+    /// least 8.
     pub workers: usize,
     /// The stack each worker thread reserves, in bytes. Reserved address space, not
     /// memory: pages are committed as the stack grows. Default: 128 MiB. Measured
