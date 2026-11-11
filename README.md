@@ -7,10 +7,17 @@ runs an s-expression whose builtins **are the kernel verbs** — `source`, `sink
 eval's own capability. Code is a resource; the capability is the builtin set.
 
 ```text
-source urn:lisp:eval '(source "urn:iki:fn:toUpper" "hi")'   # -> HI
-source urn:lisp:eval '(+ 1 2)'                               # -> 3
-source urn:lisp:eval '(map (lambda (w) (source "urn:iki:fn:toUpper" w)) (list "a" "b"))'
+source urn:lisp:eval in="(+ 1 2)"                                   # -> 3
+source urn:lisp:eval in="(source \"urn:iki:fn:toUpper\" \"hi\")"    # -> HI
+source urn:lisp:eval in="(map (lambda (w) (source \"urn:iki:fn:toUpper\" w)) (list \"a\" \"b\"))"
 ```
+
+These are lines for the ikigai REPL. The program is the eval's `in` argument, and at the
+REPL an argument with spaces goes in **double quotes**, with each `"` inside it written
+`\"`. Single quotes do not group an argument there (`'` is Lisp's quote), so
+`source urn:lisp:eval '(+ 1 2)'` is refused with `trailing input after the pipeline`.
+`in=` may be left out: `source urn:lisp:eval "(+ 1 2)"` sends the value as `in` too.
+`tests/pipeline.rs` runs each line above through the REPL engine.
 
 ## Capability model
 
@@ -227,7 +234,11 @@ resource's thread invalidates the cached eval automatically.
 ## Reaching every endpoint — `(invoke …)`
 
 The `(source iri [input])` / `(sink iri content)` wrappers carry the one
-conventional argument each verb usually needs. `(invoke …)` is the **general
+conventional argument each verb usually needs: `(source iri value)` sends `value` as
+the argument named `in`, and `(sink iri value)` as `content`. An endpoint whose required
+argument has another name refuses that call (``missing required argument `text` ``, for one
+that needs `text`); name the argument with `(invoke 'source "<iri>" "<arg>" value)`,
+here `(invoke 'source "<iri>" "text" value)`. `(invoke …)` is the **general
 verb**: it takes a verb, an IRI, and trailing `"name" value` pairs, so a program
 can drive *any* action's named arguments — not just the single-input ones:
 

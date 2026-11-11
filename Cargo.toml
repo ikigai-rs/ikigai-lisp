@@ -78,7 +78,8 @@ ikigai-fn = "0.10.0"
 ikigai-sparql = "0.5.0"
 # The real REPL engine proves positional and piped routing (`tests/pipeline.rs`).
 # All these released siblings share core 0.3 with the library.
-ikigai-engine = "0.3.0"
+# 0.4.0 adds Engine::with_scope; the old 0.3 pin excludes it under Cargo's 0.x rules.
+ikigai-engine = "0.4.0"
 # The engine reads each contract as `Meta as=application/json`; the test kernel must answer,
 # or the engine fails OPEN and routes every value to `in`, proving nothing.
 serde_json = "1"

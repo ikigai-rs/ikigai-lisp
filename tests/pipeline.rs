@@ -65,13 +65,29 @@ fn space() -> Fallback {
             ikigai_lisp::program("bare", "(+ 1 2)"),
         )
         .bind(
+            // An endpoint whose required argument is not `in`: `(source iri value)` cannot
+            // reach it, `(invoke 'source iri "text" value)` can (README).
+            Exact::new("urn:test:wrap"),
+            FnEndpoint::new("wrap", |inv: &Invocation<'_>| {
+                let text = inv.inline_str("text")?;
+                Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    format!("[{text}]").into_bytes(),
+                ))
+            }),
+        )
+        .bind(
             // A real key IRI is not needed: a routed value reaches the door, which refuses
             // the untrusted key — a refusal only the DOOR can make. A value the engine
             // could not route never gets that far.
             Exact::new("urn:lisp:run"),
             ikigai_lisp::run_signed(["urn:test:trusted"]),
         );
-    Fallback::new(vec![Arc::new(fixtures), Arc::new(ikigai_lisp::space())])
+    Fallback::new(vec![
+        Arc::new(fixtures),
+        Arc::new(ikigai_lisp::space()),
+        Arc::new(ikigai_fn::space()), // `urn:iki:fn:toUpper`, for the README's examples
+    ])
 }
 
 fn engine() -> Engine {
@@ -160,6 +176,64 @@ fn a_piped_value_reaches_the_signed_run_door_as_its_data() {
     assert_reached_the_run_door(run(
         r#"source urn:test:piped | urn:lisp:run in="(input)" sig=x key=urn:test:untrusted"#,
     ));
+}
+
+// ---- the README's REPL lines --------------------------------------------------------
+
+/// The README's first example block, line by line: each REPL line with the answer its
+/// `# -> ` comment promises (`None` when it promises none). Read from the README itself,
+/// so an example that stops working at the REPL fails here (ledger #3179).
+fn readme_examples() -> Vec<(String, Option<String>)> {
+    let readme = include_str!("../README.md");
+    let block = readme
+        .split("```text\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("the README opens with a ```text example block");
+    block
+        .lines()
+        .filter(|line| line.starts_with("source "))
+        .map(|line| match line.split_once("# -> ") {
+            Some((cmd, want)) => (cmd.trim_end().to_string(), Some(want.trim().to_string())),
+            None => (line.trim_end().to_string(), None),
+        })
+        .collect()
+}
+
+#[test]
+fn every_readme_example_runs_at_the_repl() {
+    let examples = readme_examples();
+    assert!(examples.len() >= 3, "the README's examples were not found");
+    for (line, want) in examples {
+        let out = run(&line).unwrap_or_else(|e| panic!("README line `{line}` fails: {e}"));
+        if let Some(want) = want {
+            assert_eq!(out.trim_end(), want, "README line `{line}`");
+        }
+    }
+}
+
+#[test]
+fn a_single_quoted_program_is_not_one_argument_at_the_repl() {
+    // What the README used to show: `'` is not an argument quote to the engine, so the
+    // line splits at the space and the rest is refused. The README says so and shows `"`.
+    let err = run("source urn:lisp:eval '(+ 1 2)'").expect_err("single quotes do not group");
+    assert!(err.contains("trailing input"), "unexpected refusal: {err}");
+    let out = run(r#"source urn:lisp:eval "(+ 1 2)""#).expect("double quotes group");
+    assert_eq!(out.trim_end(), "3");
+}
+
+#[test]
+fn the_source_wrapper_sends_its_value_as_in_and_invoke_names_another() {
+    let err = run(r#"source urn:lisp:eval in="(source \"urn:test:wrap\" \"hi\")""#)
+        .expect_err("`(source iri value)` names its value `in`, not `text`");
+    assert!(
+        err.contains("missing required argument `text`"),
+        "unexpected refusal: {err}"
+    );
+    let out =
+        run(r#"source urn:lisp:eval in="(invoke 'source \"urn:test:wrap\" \"text\" \"hi\")""#)
+            .expect("invoke names the argument");
+    assert_eq!(out.trim_end(), "[hi]");
 }
 
 // ---- the witness ----------------------------------------------------------------------
