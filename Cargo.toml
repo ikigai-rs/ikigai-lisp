@@ -23,7 +23,9 @@ name = "ikigai-lisp"
 # 24 allowlist entries, all evaluation-local, none reaching the host. Additive: a patch.
 # 0.5.0 (ledger #3066, cascade epic #2975): adopt core 0.3, the scoped content store (ledger #2965).
 # Breaking for consumers: public core types now come from the 0.3 line.
-version = "0.5.0"
+# 0.5.1 (ledger #3180): no stderr line from Steel on an account without `~/.local/share`.
+# When Steel would fail to create its home there, `STEEL_HOME` is set once to that same path.
+version = "0.5.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."

@@ -282,9 +282,11 @@ use ikigai_core::{
 };
 use ikigai_sexpr::Sexpr;
 use std::cell::RefCell;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use steel::rerrs::{ErrorKind, SteelErr};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
@@ -1459,16 +1461,16 @@ fn build_engine() -> Engine {
 /// read its stdlib from here.
 ///
 /// Nothing here creates Steel's home directory (`$STEEL_HOME`, else `~/.steel`, else
-/// `$XDG_DATA_HOME/steel`). Up to 0.3.0 this crate created it, because `steel-core` creates
-/// it with `create_dir`, not `create_dir_all`, and on a fresh service user that fails and
-/// prints to stderr. Nothing a program can do reads it: it holds `cogs/` for path `require`
-/// (refused by [`sandbox::screen`] and [`sandbox::lock_down`]'s resolver), `native/` for
-/// dylibs (blocked by `new_sandboxed`) and `cached-modules/`, which `steel-core` 0.8.3 never
-/// reads or writes (`CompiledModuleCache::cache_module` and `cached_mut` have no callers).
-/// Steel still needs the home PATH — every engine build unwraps it — but not the directory,
-/// so the cost of not creating it is that one stderr line, once per process, on an account
-/// whose `~/.local/share` does not exist (ledger #921).
+/// `$XDG_DATA_HOME/steel`). Up to 0.3.0 this crate created it. Nothing a program can do reads
+/// it: it holds `cogs/` for path `require` (refused by [`sandbox::screen`] and
+/// [`sandbox::lock_down`]'s resolver), `native/` for dylibs (blocked by `new_sandboxed`) and
+/// `cached-modules/`, which `steel-core` 0.8.3 never reads or writes
+/// (`CompiledModuleCache::cache_module` and `cached_mut` have no callers). Steel still needs
+/// the home PATH (every engine build unwraps it), but not the directory (ledger #921).
+/// [`quiet_steel_home`] keeps Steel from printing to stderr when it cannot create that
+/// directory (ledger #3180).
 fn build_unlocked_engine() -> Engine {
+    quiet_steel_home();
     let mut engine = Engine::new_sandboxed();
     register_primitives(&mut engine);
     for stage in PRELUDE_STAGES {
@@ -1477,6 +1479,143 @@ fn build_unlocked_engine() -> Engine {
             .expect("lisp: prelude is a constant and must compile");
     }
     engine
+}
+
+/// Keep Steel from printing to stderr on an account without `~/.local/share` (ledger #3180).
+///
+/// The first engine build in a process resolves Steel's home once. With no `STEEL_HOME` and
+/// no `~/.steel`, Steel takes `$XDG_DATA_HOME/steel` (default `~/.local/share/steel`) and
+/// creates it with `create_dir`, not `create_dir_all`. When the data home is missing, that
+/// fails and Steel prints `Unable to create steel home directory …` to stderr. The Lisp
+/// output is fine, but the line leaks into transcripts.
+///
+/// In that case, and only then, this sets `STEEL_HOME` to the same path before Steel reads
+/// it. Steel takes a `STEEL_HOME` as given, without trying to create it. Steel ends up with
+/// the path it would have used anyway, still no directory, and nothing on stderr. Every other
+/// case is left alone: a host that sets `STEEL_HOME`, has a `~/.steel` or has a data home
+/// sees no change. Creating the directory instead would write to the host's home, which this
+/// crate stopped doing in 0.3.1.
+///
+/// The variable is set at most once per process, before the first engine is built. It is
+/// visible to the rest of the process and inherited by its children. As with any
+/// `set_var`, C code that reads the environment on another thread at that moment races the
+/// write. A host that cannot accept that sets `STEEL_HOME` itself at startup, and then this
+/// sets nothing.
+fn quiet_steel_home() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let env_home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+        let unwritable = unwritable_steel_home(
+            std::env::var_os("STEEL_HOME").is_some(),
+            env_home.map(PathBuf::from),
+            std::env::var_os("XDG_DATA_HOME"),
+            std::env::home_dir(),
+            |path| path.exists(),
+        );
+        if let Some(path) = unwritable {
+            std::env::set_var("STEEL_HOME", path);
+        }
+    });
+}
+
+/// The home `steel-core` 0.8.3 would fail to create, printing to stderr, or `None` when it
+/// would not print. This follows `STEEL_HOME` in its `compiler/modules.rs`: an explicit
+/// `STEEL_HOME` (`steel_home_set`); else `$HOME/.steel` if it exists (`env_home`, `HOME`
+/// alone, as Steel's `env_home` crate reads it); else `steel` in the XDG data home, which is
+/// an absolute `XDG_DATA_HOME`, else `.local/share` under `home` (`std::env::home_dir`, as
+/// Steel's `xdg` crate reads it). Steel creates that last one only if it is missing, and
+/// creation fails when the data home is missing too. Pure apart from `exists`, so the order is
+/// tested without touching the process environment.
+fn unwritable_steel_home(
+    steel_home_set: bool,
+    env_home: Option<PathBuf>,
+    xdg_data_home: Option<OsString>,
+    home: Option<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if cfg!(windows) || steel_home_set {
+        return None;
+    }
+    if env_home.is_some_and(|home| exists(&home.join(".steel"))) {
+        return None;
+    }
+    let data_home = xdg_data_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| home.join(".local").join("share")))?;
+    let steel = data_home.join("steel");
+    (!exists(&steel) && !exists(&data_home)).then_some(steel)
+}
+
+#[cfg(test)]
+mod steel_home {
+    use super::unwritable_steel_home;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    fn path(value: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(value))
+    }
+
+    /// `exists` over a fixed set of paths.
+    fn only<'a>(present: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
+        move |path| present.iter().any(|p| Path::new(p) == path)
+    }
+
+    #[test]
+    fn a_missing_data_home_is_pinned() {
+        assert_eq!(
+            unwritable_steel_home(false, path("/h"), None, path("/h"), only(&["/h"])),
+            path("/h/.local/share/steel")
+        );
+    }
+
+    #[test]
+    fn an_explicit_steel_home_is_left_alone() {
+        assert_eq!(
+            unwritable_steel_home(true, path("/h"), None, path("/h"), only(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dot_steel_is_left_alone() {
+        assert_eq!(
+            unwritable_steel_home(false, path("/h"), None, path("/h"), only(&["/h/.steel"])),
+            None
+        );
+    }
+
+    #[test]
+    fn an_existing_data_home_is_left_alone() {
+        let exists = only(&["/h/.local/share"]);
+        assert_eq!(
+            unwritable_steel_home(false, path("/h"), None, path("/h"), exists),
+            None
+        );
+    }
+
+    #[test]
+    fn an_absolute_xdg_data_home_wins_and_a_relative_one_is_ignored() {
+        let xdg = Some(OsString::from("/xdg"));
+        assert_eq!(
+            unwritable_steel_home(false, path("/h"), xdg, path("/h"), only(&[])),
+            path("/xdg/steel")
+        );
+        let relative = Some(OsString::from("xdg"));
+        assert_eq!(
+            unwritable_steel_home(false, path("/h"), relative, path("/h"), only(&[])),
+            path("/h/.local/share/steel")
+        );
+    }
+
+    #[test]
+    fn no_home_at_all_is_left_alone() {
+        assert_eq!(
+            unwritable_steel_home(false, None, None, None, only(&[])),
+            None
+        );
+    }
 }
 
 /// Run `src` on `engine` (built for this eval alone) and render its last value. Returns the

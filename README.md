@@ -309,20 +309,24 @@ are named. Both still accept `content` from a caller that sends it by name (a re
 `urn:decide:accept`), but do not declare it: a second optional input leaves the REPL
 engine two places to put a value and it refuses the line (`tests/pipeline.rs`).
 
-### One stderr line from Steel on a fresh account
+### Steel's home on a fresh account
 
-On an account whose `~/.local/share` does not exist, the first evaluation in a process
-prints one line to stderr:
+Steel looks up a home directory once per process: `STEEL_HOME`, else `~/.steel`, else
+`~/.local/share/steel` (or `$XDG_DATA_HOME/steel`). No program can read it: path `require`
+and native modules are refused by the sandbox. When `~/.local/share` does not exist, Steel
+cannot create its directory there, and up to 0.5.0 it printed one line to stderr:
 
 ```text
 Unable to create steel home directory "/home/svc/.local/share/steel": No such file or directory (os error 2)
 ```
 
-It is harmless: no program can read Steel's home directory (path `require` and native
-modules are refused by the sandbox), and evaluation goes on. It comes from `steel-core`,
-which creates that directory with `create_dir` rather than `create_dir_all`, and this
-crate cannot turn it off. To silence it on a host, set `STEEL_HOME` in the service's
-environment to a directory that exists, or create `~/.local/share` for the account.
+Since 0.5.1 nothing is printed (ledger #3180). In that case alone, before the first
+evaluation, this crate sets `STEEL_HOME` in its own process to the path Steel would have
+chosen. Steel accepts a `STEEL_HOME` as given and does not try to create it, so it gets the
+same path, still creates no directory, and prints nothing (`tests/empty_home.rs`). A
+host that sets `STEEL_HOME`, has `~/.steel` or has a data home is left alone. The variable
+is visible to the rest of the process and to its children. A host that would rather not have
+its environment changed at run time sets `STEEL_HOME` at startup.
 
 Native-only: the synchronous Steel engine reaches the async kernel through core's
 `Invocation::scope_sync` bridge (real threads), so there is no wasm face yet. Builtin-set filtering by capability
