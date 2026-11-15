@@ -114,6 +114,22 @@ not grant it authority or automatically make a program cacheable. The closure pi
 checks both comparator paths, and integration tests cover native/Lisp comparators,
 input preservation, literal/Unicode splitting, errors and comparator refusals.
 
+**Arithmetic, folds and tables** (ledger #2720): `/`, `sqrt`, `exact->inexact`, `sin`,
+`cos`, `asin`, `atan`, `abs`, `min`, `max`, `floor`, `round` and `zero?`; `string-join`;
+`foldl`, `foldr`, `last`, `take` and `drop`; and the immutable hash tables `hash`,
+`hash-insert`, `hash-try-get`, `hash-contains?` and `hash->list`. Each takes values
+and answers a value, with no port, file, process, environment or module in reach, and
+each allocates in proportion to what it is given: `take` and `drop` take a count but
+walk only the list they are handed, and a hash table is persistent, so inserting
+answers a new table rather than changing a shared one. `expt` stays refused because an
+exact power allocates out of proportion to its input. The 10 internals this adds are
+the stdlib definitions of `foldl`, `foldr`, `fold`, `drop`, `min`, `max`, `sub1` and
+`zero?`, which are plain recursion, and the `#%prim.-` and `#%prim.<` they call. The
+set is kept to what the item asked for (division, roots, the trigonometry a
+great-circle distance needs, string joining, folds, a tally table) because the pin
+also checks that the allowlist stays under a tenth of Steel's globals: it is at 184 of
+1,848, so the next addition has to fit there or argue for a different bound.
+
 **Lifted functions** are the one class. The compiler lifts a lambda that captures nothing
 into a global named `##__lifted_pure_function<parse counter>`, so the names cannot be
 listed. A capture-free closure holds no authority of its own (it reaches globals, which are
@@ -167,7 +183,7 @@ reproduction's input and asserts the refusal, a typed `Denied`; none reaches the
 ## What changes for a program
 
 Anything outside the lists is refused, including names a REPL user may reach for: output
-(`display`), `string-join`, `when`/`unless`, `struct`. Adding a pure function
+(`display`), `expt`, `when`/`unless`, `struct`. Adding a pure function
 or a macro is a one-line change to a list, and the pins say whether the stdlib needs
 anything more for it. `(read)` with no port is an error that says to read from a string
 port. The ikigai-programs corpus runs unchanged (177 tests).
