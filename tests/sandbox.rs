@@ -74,6 +74,100 @@ fn shaping_functions_propagate_catchable_errors() {
     );
 }
 
+/// Ledger #2720: division, roots, trigonometry and conversion are pure arithmetic.
+#[test]
+fn arithmetic_beyond_the_integers_is_available() {
+    for (src, expected) in [
+        ("(/ 7 2)", "7/2"),
+        ("(/ 6 3)", "2"),
+        ("(/ 7.0 2)", "3.5"),
+        ("(exact->inexact (/ 1 4))", "0.25"),
+        ("(sqrt 16)", "4"),
+        ("(sqrt 2)", "1.4142135623730951"),
+        ("(sin 0)", "0.0"),
+        ("(cos 0)", "1.0"),
+        ("(asin 1)", "1.5707963267948966"),
+        ("(atan 1)", "0.7853981633974483"),
+        ("(abs -3)", "3"),
+        ("(min 3 1 2)", "1"),
+        ("(max 1 2.5)", "2.5"),
+        ("(floor 2.5)", "2.0"),
+        ("(round 3.5)", "4.0"),
+        ("(zero? 0)", "#true"),
+        (r#"(with-handler (lambda (e) "caught") (/ 1 0))"#, "caught"),
+    ] {
+        assert_eq!(eval(src).unwrap(), expected, "{src}");
+    }
+}
+
+/// The rung chapter 8 of the ikigai Book could not climb: a great-circle distance
+/// (haversine), London to New York, in kilometers.
+#[test]
+fn a_great_circle_distance_is_computable() {
+    let src = "(define (rad d) (* d (/ 3.141592653589793 180)))
+        (define (sq x) (* x x))
+        (define (distance lat1 lon1 lat2 lon2)
+          (let* ((a (+ (sq (sin (/ (rad (- lat2 lat1)) 2)))
+                       (* (cos (rad lat1)) (cos (rad lat2))
+                          (sq (sin (/ (rad (- lon2 lon1)) 2)))))))
+            (* 2 6371 (asin (sqrt a)))))
+        (round (distance 51.5007 0.1246 40.6892 -74.0445))";
+    assert_eq!(eval(src).unwrap(), "5591.0");
+}
+
+/// Ledger #2720: the helpers chapter 8 hand-wrote (`last`, `first-n`, `join-lines`, an
+/// assoc tally) are Steel's own.
+#[test]
+fn folds_slices_joins_and_tables_are_available() {
+    for (src, expected) in [
+        (r#"(string-join (list "a" "b" "c") "\n")"#, "a\nb\nc"),
+        (r#"(string-join (list "a" "b"))"#, "ab"),
+        (r#"(string-join (list) ",")"#, ""),
+        ("(foldl + 0 (list 1 2 3))", "6"),
+        ("(foldl cons '() (list 1 2 3))", "(3 2 1)"),
+        ("(foldr cons '() (list 1 2 3))", "(1 2 3)"),
+        ("(last (list 1 2 3))", "3"),
+        ("(take (list 1 2 3) 2)", "(1 2)"),
+        ("(take (list 1 2 3) 5)", "(1 2 3)"),
+        ("(drop (list 1 2 3) 2)", "(3)"),
+        ("(hash-try-get (hash 'a 1) 'a)", "1"),
+        ("(hash-try-get (hash 'a 1) 'b)", "#false"),
+        ("(hash-contains? (hash 'a 1) 'a)", "#true"),
+        ("(hash->list (hash-insert (hash) 'a 1))", "((a . 1))"),
+        // A table is a value: inserting answers a new one and leaves the old alone.
+        (
+            "(define h (hash 'a 1)) (hash-insert h 'b 2) (hash->list h)",
+            "((a . 1))",
+        ),
+        // A tally, as chapter 8's program keeps one.
+        (
+            "(define (tally xs)
+               (foldl (lambda (x h) (hash-insert h x (+ 1 (or (hash-try-get h x) 0))))
+                      (hash) xs))
+             (sort (hash->list (tally (list 'b 'a 'b)))
+                   (lambda (p q) (> (cdr p) (cdr q))))",
+            "((b . 2) (a . 1))",
+        ),
+    ] {
+        assert_eq!(eval(src).unwrap(), expected, "{src}");
+    }
+    for src in [
+        r#"(with-handler (lambda (e) "caught") (string-join (list "a" 1) ","))"#,
+        r#"(with-handler (lambda (e) "caught") (last (list)))"#,
+        r#"(with-handler (lambda (e) "caught") (take (list 1 2) -1))"#,
+        r#"(with-handler (lambda (e) "caught") (drop (list 1 2) 5))"#,
+    ] {
+        assert_eq!(eval(src).unwrap(), "caught", "{src}");
+    }
+    // A fold's function runs in the same sandbox as the rest of the program.
+    refused(
+        r#"(foldl (lambda (x acc) (env-var "HOME")) 0 (list 1))"#,
+        "env-var",
+    );
+    // An exact power allocates out of proportion to its input, so it stays refused.
+    refused("(expt 2 3)", "expt");
+}
+
 /// Assert `src` is refused as `Denied`, naming `what`.
 fn refused(src: &str, what: &str) {
     match eval(src) {

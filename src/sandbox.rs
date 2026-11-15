@@ -71,10 +71,23 @@ pub(crate) const PROGRAM_NAMES: &[&str] = &[
     // Numbers.
     "+", "-", "*", "<", "<=", "=", ">", ">=", "modulo", "quotient", "integer?", "number?",
     "number->string", "string->number",
+    // Arithmetic beyond the integers (ledger #2720): division, square roots, the
+    // trigonometry a great-circle distance needs, rounding and conversion. Each takes
+    // numbers and answers one number; none takes a size. `expt` stays refused: an exact
+    // power allocates out of proportion to its input.
+    "/", "abs", "min", "max", "zero?", "floor", "round", "sqrt", "sin", "cos", "asin",
+    "atan", "exact->inexact",
     // Lists.
     "list", "cons", "car", "cdr", "cadr", "caddr", "cddr", "append", "reverse", "length",
     "list?", "null?", "map", "filter", "assoc", "vector", "sort",
+    // Folding and slicing a list (ledger #2720). `take` and `drop` take a count, but
+    // only of the list they are given, so they allocate no more than it holds.
+    "foldl", "foldr", "last", "take", "drop",
+    // Immutable hash tables (ledger #2720): each insert answers a new table, so a table
+    // is a value like a list and holds no authority.
+    "hash", "hash-insert", "hash-try-get", "hash-contains?", "hash->list",
     // Strings and characters.
+    "string-join",
     "string?", "string-append", "string-length", "string-upcase", "string-downcase",
     "substring", "string->list", "list->string", "split-whitespace", "split-many", "ends-with?",
     "to-string", "symbol->string", "char->integer", "utf8-length",
@@ -121,6 +134,14 @@ pub(crate) const STDLIB_INTERNALS: &[Name] = &[
     In("#%private/steel/sort", "quick-1"), In("#%private/steel/sort", "partition"),
     In("#%private/steel/sort", "ploop"), In("#%private/steel/sort", "uploop"),
     In("#%private/steel/sort", "downloop"),
+    // The stdlib definitions behind the folds, `drop`, `min`, `max` and `zero?`
+    // (ledger #2720), and the two primitives they call: plain recursion over a list
+    // or a number.
+    Top("#%prim.-"), Top("#%prim.<"),
+    In("#%private/steel/stdlib", "foldl"), In("#%private/steel/stdlib", "foldr"),
+    In("#%private/steel/stdlib", "fold"), In("#%private/steel/stdlib", "drop"),
+    In("#%private/steel/stdlib", "min"), In("#%private/steel/stdlib", "max"),
+    In("#%private/steel/stdlib", "sub1"), In("#%private/steel/stdlib", "zero?"),
     // What the prelude's `read` uses: drain a string port, trim it, say eof or error.
     Top("#%string-input-port?"), Top("read-port-to-string"),
     In("#%private/steel/ports", "read-port-to-string"), Top("trim"), Top("eof-object"),

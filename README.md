@@ -68,7 +68,7 @@ uncaught. The pins: the names a program can reach after build EQUAL the allowlis
 test observes every global before and after lock-down), and the derived list equals
 the closure of the program list over THIS Steel's stdlib, so an upgrade that moves
 Steel's internals fails CI saying which way. Anything off the list is refused —
-`display`, `string-join`, `when`, `struct` — and adding a pure function or
+`display`, `expt`, `when`, `struct` — and adding a pure function or
 macro is a one-line change the pins then check. The lists, how they were derived and
 how to regenerate them: `src/sandbox.rs` and `docs/design/sandbox-allowlist.md`.
 
@@ -83,6 +83,19 @@ characters, and empty fields are preserved (including trailing ones). An empty
 delimiter splits at Unicode character boundaries, with empty fields at both ends.
 These operations need no host access. For example, a pure composition can opt into
 caching with `(cacheable (sort (map string->number (string-split "3,1,2" ",")) <))`.
+
+Arithmetic goes past the integers: `(/ 7 2)` is the exact `7/2`, and `exact->inexact`
+turns it into `3.5`. `sqrt`, `sin`, `cos`, `asin` and `atan` (one argument) answer
+floats, which is enough for a great-circle distance; `abs`, `min`, `max`, `floor`,
+`round` and `zero?` are there too. Dividing by zero is a catchable error. `expt` is
+not: an exact power can allocate far more than its arguments.
+
+`(string-join (list "a" "b") ",")` returns `a,b`. `(foldl + 0 xs)` and
+`(foldr cons '() xs)` fold a list (the function takes the element first, then the
+accumulator), and `last`, `(take xs n)` and `(drop xs n)` slice one. For a tally,
+`hash`, `hash-insert`, `hash-try-get` (`#f` for a missing key), `hash-contains?` and
+`hash->list` are Steel's immutable hash tables: `hash-insert` returns a new table and
+leaves the old one as it was.
 
 ## Performance
 
