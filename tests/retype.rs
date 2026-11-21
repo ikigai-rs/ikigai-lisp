@@ -26,14 +26,11 @@ fn kernel() -> Kernel {
     let fixtures = EndpointSpace::new()
         .bind(
             Exact::new("urn:test:denied"),
-            FnEndpoint::new(
-                "denied",
-                refuse(|| Error::Denied("vault is sealed".to_string())),
-            ),
+            FnEndpoint::new("denied", refuse(|| Error::Denied("vault is sealed".into()))),
         )
         .bind(
             Exact::new("urn:test:awkward"),
-            FnEndpoint::new("awkward", refuse(|| Error::Denied(AWKWARD.to_string()))),
+            FnEndpoint::new("awkward", refuse(|| Error::Denied(AWKWARD.into()))),
         )
         .bind(
             Exact::new("urn:test:busy"),
@@ -63,7 +60,7 @@ fn eval(src: &str) -> CoreResult<String> {
 fn an_uncaught_refusal_leaves_the_eval_as_itself() {
     assert_eq!(
         eval(r#"(source "urn:test:denied")"#),
-        Err(Error::Denied("vault is sealed".to_string()))
+        Err(Error::Denied("vault is sealed".into()))
     );
 }
 
@@ -73,7 +70,7 @@ fn an_uncaught_refusal_with_quotes_and_newlines_stays_typed() {
     // Steel applies is the quoting `uncaught_text` reproduces.
     assert_eq!(
         eval(r#"(source "urn:test:awkward")"#),
-        Err(Error::Denied(AWKWARD.to_string()))
+        Err(Error::Denied(AWKWARD.into()))
     );
 }
 

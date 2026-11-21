@@ -25,7 +25,9 @@ name = "ikigai-lisp"
 # Breaking for consumers: public core types now come from the 0.3 line.
 # 0.5.1 (ledger #3180): no stderr line from Steel on an account without `~/.local/share`.
 # When Steel would fail to create its home there, `STEEL_HOME` is set once to that same path.
-version = "0.5.1"
+# 0.6.0 (ledger #3928, cascade epic #3893): adopt core 0.4 (scope opacity, structured denials).
+# Breaking for consumers: public core types now come from the 0.4 line. A minor, never a patch.
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Steel-backed Lisp evaluator as an ikigai module: `urn:lisp:eval` runs s-expressions whose builtins ARE the kernel verbs (source/sink/meta/exists/delete), each cap-scoped and issued back through the kernel. Code is a resource; the capability is the builtin set."
@@ -37,17 +39,16 @@ keywords = ["ikigai", "roc", "lisp", "scheme", "capability"]
 categories = ["compilers", "caching"]
 
 [dependencies]
-# 0.3.0 is the scoped content store (ledger #2965): held content is scoped to whoever
-# delivered it, and ContentStore::put/put_replay are root-only. The old 0.2 pin meant <0.3.0
-# under 0.x rules. This caret floor admits 0.3.x so hosts share one core.
-ikigai-core = "0.3.0"
+# core 0.4.0 (scope opacity, structured denials; the cascade, epic #3893). The old 0.3 pin
+# meant <0.4.0 under 0.x rules. This caret floor admits 0.4.x so hosts share one core.
+ikigai-core = "0.4.0"
 async-trait = "0.1"
 # The neutral s-expression foundation — owns the pure `sexpr_to_sparql` (query) and
 # `sexpr_to_turtle` (graph) compilers over its language-agnostic `Sexpr` datum (single
 # source of truth). The `(sparql-select …)` and `(graph …)` builtins adapt Steel's
 # `SteelVal` into `Sexpr` and call these, rather than carrying an inline compiler.
-# 0.4.0 moves the compilers onto the core 0.3 line.
-ikigai-sexpr = "0.4.0"
+# 0.5.0 moves the compilers onto the core 0.4 line.
+ikigai-sexpr = "0.5.0"
 # The Scheme engine; its builtins are the kernel verbs. 0.8 is the current
 # embedding API (`Engine::run`, `register_fn`).
 # PINNED EXACTLY (ledger #921): the sandbox's allowlist is DERIVED from Steel's compiled
@@ -64,22 +65,31 @@ steel-core = "=0.8.3"
 # is core's `Invocation::scope_sync`, so the crate proper needs no channel deps.
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`), including the composed
-# signing doors. BODIES and BODY-INPUTS are on by default since 0.12.0; 0.14.0 is its core 0.3 release.
-ikigai-conformance = "0.14.0"
+# signing doors. BODIES and BODY-INPUTS are on by default since 0.12.0; 0.15.0 is its core 0.4 release.
+ikigai-conformance = "0.15.0"
 # The real signing module verifies stored programs through the kernel. It declares `in`
 # `reads_body` since 0.4.2 (ledger #2590), which the conformance suite's Ed25519 BODY-INPUTS
-# waiver depends on (`tests/conformance.rs`, ledger #2726). 0.5.0 is its core 0.3 release.
-ikigai-sign = "0.5.0"
+# waiver depends on (`tests/conformance.rs`, ledger #2726). 0.6.0 is its core 0.4 release.
+ikigai-sign = "0.6.0"
 # The wall-clock Timeout overlay proves the wire-eval governor end to end.
-ikigai-throttle = "0.4.0"
+# 0.6.0 is its core 0.4 release.
+ikigai-throttle = "0.6.0"
 # A real sibling proves verb-as-function across a module boundary.
-ikigai-fn = "0.10.0"
+# 0.12.0 is its core 0.4 release.
+ikigai-fn = "0.12.0"
 # The real SPARQL engine runs the compiled-query oracle end to end.
-ikigai-sparql = "0.5.0"
+# 0.6.0 is its core 0.4 release.
+ikigai-sparql = "0.6.0"
 # The real REPL engine proves positional and piped routing (`tests/pipeline.rs`).
-# All these released siblings share core 0.3 with the library.
 # 0.4.0 adds Engine::with_scope; the old 0.3 pin excludes it under Cargo's 0.x rules.
+# Every sibling above shares core 0.4 with the library; the engine is still on core 0.3.
 ikigai-engine = "0.4.0"
+# TEST ONLY: ikigai-engine ships on core 0.4 in wave 4 of the core 0.4.0 cascade (epic #3893),
+# and depends back on this crate. Until then `tests/pipeline.rs` runs the engine in a core 0.3
+# kernel of its own, named by this alias, with this crate's core 0.4 doors behind a bridge
+# (`tests/old_core/mod.rs`): requests, bytes and descriptions cross, nothing else. When the
+# engine moves to core 0.4, this alias and the bridge go and the test returns to one kernel.
+ikigai-core-for-old-modules = { package = "ikigai-core", version = "0.3.0" }
 # The engine reads each contract as `Meta as=application/json`; the test kernel must answer,
 # or the engine fails OPEN and routes every value to `in`, proving nothing.
 serde_json = "1"

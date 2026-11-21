@@ -84,6 +84,28 @@ fn iri(text: &str) -> Iri {
 /// a busy pool a caller is told to retry.
 #[test]
 fn a_self_calling_program_is_refused_as_too_deep_not_as_a_busy_pool() {
+    on_a_deep_stack(self_call_is_refused_as_too_deep);
+}
+
+/// The stack the thread that issues the self-call gets. Each nested eval's sub-request
+/// is resolved by polling it on the thread awaiting the outermost one, so the 64 levels
+/// the kernel admits before refusing sit on that one thread's stack. In an unoptimized
+/// build that took 1.75 to 2 MiB on core 0.3 and 2 to 2.25 MiB on core 0.4 (measured with
+/// `RUST_MIN_STACK`, ledger #3928). A spawned test thread gets 2 MiB, so the test aborted
+/// with a stack overflow before the kernel could refuse the call. An optimized build fits
+/// in 2 MiB. 8 MiB is a main thread's stack, which leaves ample room.
+const ISSUER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn on_a_deep_stack(body: fn()) {
+    std::thread::Builder::new()
+        .stack_size(ISSUER_STACK_BYTES)
+        .spawn(body)
+        .expect("spawn the issuing thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn self_call_is_refused_as_too_deep() {
     let err = block_on(kernel().issue(
         Request::new(Verb::Source, iri("urn:self")),
         &Capability::root(),
