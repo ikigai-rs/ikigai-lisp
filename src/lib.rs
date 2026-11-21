@@ -456,9 +456,9 @@ impl Endpoint for LispEval {
         // invocation, a module shim. A typed `Denied` (permanent, never transient).
         source_only(inv, "urn:lisp:eval")?;
         if !inv.capability.allows(CAP_LISP) {
-            return Err(Error::Denied(format!(
-                "urn:lisp:eval requires the {CAP_LISP} capability"
-            )));
+            return Err(Error::Denied(
+                format!("urn:lisp:eval requires the {CAP_LISP} capability").into(),
+            ));
         }
 
         // The dialect is fixed to `steel` in slice 1; reject anything else rather
@@ -682,9 +682,9 @@ impl Endpoint for LispProgram {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         source_only(inv, &self.id)?;
         if !inv.capability.allows(CAP_LISP) {
-            return Err(Error::Denied(format!(
-                "running a Lisp program requires the {CAP_LISP} capability"
-            )));
+            return Err(Error::Denied(
+                format!("running a Lisp program requires the {CAP_LISP} capability").into(),
+            ));
         }
         // The piped tuple/body is the program's DATA (via `(input)`), never its source.
         // `content` is still read, undeclared, for the callers that name it (a reactor,
@@ -843,9 +843,10 @@ impl Endpoint for SignedRun {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
         source_only(inv, "urn:lisp:run")?;
         if !inv.capability.allows(CAP_LISP_RUN) {
-            return Err(Error::Denied(format!(
-                "submitting a signed program requires the {CAP_LISP_RUN} capability"
-            )));
+            return Err(Error::Denied(
+                format!("submitting a signed program requires the {CAP_LISP_RUN} capability")
+                    .into(),
+            ));
         }
         // The PROGRAM must be explicit — a signed artifact is named, never
         // ambiently piped (piped content is the program's DATA, below).
@@ -866,9 +867,9 @@ impl Endpoint for SignedRun {
         // signature by an un-enrolled key is still a refusal — trust is the
         // host's declaration, not the signer's.
         if !self.trusted.contains(&key) {
-            return Err(Error::Denied(format!(
-                "key `{key}` is not in this host's code-signing trust set"
-            )));
+            return Err(Error::Denied(
+                format!("key `{key}` is not in this host's code-signing trust set").into(),
+            ));
         }
 
         // Gate 1b: verify the program bytes against the signature-graph, through
@@ -884,9 +885,9 @@ impl Endpoint for SignedRun {
         let verdict = inv.issue(verify).await?;
         let verdict = String::from_utf8_lossy(&verdict.bytes).to_string();
         if !verdict.starts_with("valid") {
-            return Err(Error::Denied(format!(
-                "program signature rejected ({key}): {verdict}"
-            )));
+            return Err(Error::Denied(
+                format!("program signature rejected ({key}): {verdict}").into(),
+            ));
         }
 
         // Gates 2 + 3 live in run_eval: the session's capability bounds every
@@ -1621,13 +1622,13 @@ mod steel_home {
 /// Run `src` on `engine` (built for this eval alone) and render its last value. Returns the
 /// rendered text, or a lisp/eval error.
 fn run_program(engine: &mut Engine, src: String) -> Result<String> {
-    sandbox::screen(&src).map_err(|why| Error::Denied(format!("lisp: {why}")))?;
+    sandbox::screen(&src).map_err(|why| Error::Denied(format!("lisp: {why}").into()))?;
     let values = engine.run(src).map_err(|e| {
         let text = format!("lisp: {e}");
         // A refused name the program called and did not catch is the sandbox saying no:
         // a permanent, typed refusal, like the screen's.
         if text.contains(sandbox::REFUSAL_MARK) {
-            Error::Denied(text)
+            Error::Denied(text.into())
         } else {
             Error::Endpoint(text)
         }
@@ -1922,7 +1923,7 @@ mod tests {
     impl Endpoint for DenyingVault {
         async fn invoke(&self, inv: &Invocation<'_>) -> CoreResult<Representation> {
             if inv.request.verb == Verb::Sink && !inv.capability.allows("urn:cap:test:write") {
-                return Err(Error::Denied("vault: no write grant".to_string()));
+                return Err(Error::Denied("vault: no write grant".into()));
             }
             Ok(Representation::new(text_plain_utf8(), b"stored".to_vec()))
         }
