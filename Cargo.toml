@@ -81,15 +81,9 @@ ikigai-fn = "0.12.0"
 # 0.6.0 is its core 0.4 release.
 ikigai-sparql = "0.6.0"
 # The real REPL engine proves positional and piped routing (`tests/pipeline.rs`).
-# 0.4.0 adds Engine::with_scope; the old 0.3 pin excludes it under Cargo's 0.x rules.
-# Every sibling above shares core 0.4 with the library; the engine is still on core 0.3.
-ikigai-engine = "0.4.0"
-# TEST ONLY: ikigai-engine ships on core 0.4 in wave 4 of the core 0.4.0 cascade (epic #3893),
-# and depends back on this crate. Until then `tests/pipeline.rs` runs the engine in a core 0.3
-# kernel of its own, named by this alias, with this crate's core 0.4 doors behind a bridge
-# (`tests/old_core/mod.rs`): requests, bytes and descriptions cross, nothing else. When the
-# engine moves to core 0.4, this alias and the bridge go and the test returns to one kernel.
-ikigai-core-for-old-modules = { package = "ikigai-core", version = "0.3.0" }
+# core 0.4 cascade restore (ledger #3935): 0.6.0 is its core 0.4 release, so the engine and
+# this crate share one kernel again and the test-only core 0.3 alias and bridge are gone.
+ikigai-engine = "0.6.0"
 # The engine reads each contract as `Meta as=application/json`; the test kernel must answer,
 # or the engine fails OPEN and routes every value to `in`, proving nothing.
 serde_json = "1"
