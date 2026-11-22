@@ -14,34 +14,28 @@
 //! JSON meta renderer every line below "works", whatever the doors declare, so the kernel
 //! here is built with `Kernel::with_meta_renderer`, and the last test is the witness
 //! that the contract is really being read.
-//!
-//! Two cores, for now: the engine is on core 0.3 and this crate on core 0.4, so the engine's
-//! kernel (core 0.3, with the JSON renderer) holds a bridge to every door of [`space`], which
-//! runs in a core 0.4 kernel of its own (`old_core/mod.rs`; the manifest says when it goes).
-
-mod old_core;
 
 use std::sync::Arc;
 
 use futures::executor::block_on;
 use ikigai_core::{
-    EndpointSpace, Exact, Fallback, FnEndpoint, Invocation, ReprType, Representation,
+    Description, EndpointSpace, Exact, Fallback, FnEndpoint, Invocation, Kernel, MetaRenderer,
+    ReprType, Representation,
 };
-use ikigai_core_for_old_modules as old;
 use ikigai_engine::{Action, Engine};
 
 /// The contract renderer the engine actually asks for. Without it these tests would pass
 /// over doors whose arguments could be named anything.
 struct JsonRenderer;
 
-impl old::MetaRenderer for JsonRenderer {
+impl MetaRenderer for JsonRenderer {
     fn render(
         &self,
-        description: &old::Description,
-        _target: &old::ReprType,
-    ) -> old::Result<old::Representation> {
-        Ok(old::Representation::new(
-            old::ReprType::new("application/json"),
+        description: &Description,
+        _target: &ReprType,
+    ) -> ikigai_core::Result<Representation> {
+        Ok(Representation::new(
+            ReprType::new("application/json"),
             serde_json::to_vec(description).expect("serialize description"),
         ))
     }
@@ -97,8 +91,8 @@ fn space() -> Fallback {
 }
 
 fn engine() -> Engine {
-    Engine::new(old::Kernel::with_meta_renderer(
-        Arc::new(old_core::bridged(space())),
+    Engine::new(Kernel::with_meta_renderer(
+        Arc::new(space()),
         Arc::new(JsonRenderer),
     ))
 }
