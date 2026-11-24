@@ -2547,9 +2547,12 @@ mod tests {
             out.contains("ex:alice foaf:name \"Alice\" ."),
             "expected the name triple, got: {out}"
         );
+        // Turtle spells the type triple either way, and ikigai-sexpr 0.5.1 began writing
+        // the `a` shorthand: the test pins the triple, not the spelling.
         assert!(
-            out.contains("ex:alice rdf:type foaf:Person ."),
-            "expected `a` to render as rdf:type, got: {out}"
+            out.contains("ex:alice rdf:type foaf:Person .")
+                || out.contains("ex:alice a foaf:Person ."),
+            "expected the type triple, got: {out}"
         );
     }
 
