@@ -1506,12 +1506,17 @@ fn quiet_steel_home() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let env_home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "ambient: fs: Steel reads STEEL_HOME/HOME itself; this probe only decides whether to set STEEL_HOME to avoid a failed directory creation"
+        )]
+        let exists = |path: &Path| path.exists();
         let unwritable = unwritable_steel_home(
             std::env::var_os("STEEL_HOME").is_some(),
             env_home.map(PathBuf::from),
             std::env::var_os("XDG_DATA_HOME"),
             std::env::home_dir(),
-            |path| path.exists(),
+            exists,
         );
         if let Some(path) = unwritable {
             std::env::set_var("STEEL_HOME", path);
